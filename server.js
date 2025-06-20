@@ -338,6 +338,40 @@ app.get('/api/users', (req, res) => {
   });
 });
 
+// ランキング取得
+app.get('/api/ranking', (req, res) => {
+  try {
+    // ライブデータから配列を作成
+    const users = Array.from(liveData.values());
+    
+    // ダイヤモンド数でソート（降順）
+    const dailyRanking = users
+      .filter(user => user.totalDiamonds > 0) // ダイヤモンドがあるユーザーのみ
+      .sort((a, b) => b.totalDiamonds - a.totalDiamonds)
+      .map((user, index) => ({
+        rank: index + 1,
+        username: user.username,
+        totalDiamonds: user.totalDiamonds,
+        totalGifts: user.totalGifts,
+        totalComments: user.totalComments,
+        viewerCount: user.viewerCount,
+        isLive: user.isLive,
+        estimatedEarnings: Math.round(user.totalDiamonds * 0.005 * 100) / 100, // $5/1000ダイヤモンド
+        lastUpdate: user.lastUpdate
+      }));
+    
+    res.json({
+      ranking: dailyRanking,
+      totalUsers: users.length,
+      activeUsers: dailyRanking.length,
+      lastUpdate: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('ランキング取得エラー:', error);
+    res.status(500).json({ error: 'ランキング取得に失敗しました' });
+  }
+});
+
 // ライブデータ取得
 app.get('/api/live-data', (req, res) => {
   res.json(Object.fromEntries(liveData));
