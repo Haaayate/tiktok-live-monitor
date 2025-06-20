@@ -78,7 +78,15 @@ async function connectToTikTokLive(username) {
       io.emit('live-data-update', { username, data: initialData });
     }).catch(err => {
       console.error(`${username}: 接続エラー`, err);
+      
+      // 接続失敗時はliveDataからも削除
+      liveData.delete(username);
+      
+      // エラー情報をフロントエンドに送信
       io.emit('user-error', { username, error: err.message });
+      
+      // 接続失敗時は例外を投げる
+      throw err;
     });
 
     // コメントイベント
@@ -239,7 +247,18 @@ app.post('/api/add-user', async (req, res) => {
     
     res.json({ message: `${cleanUsername} の監視を開始しました` });
   } catch (error) {
-    res.status(500).json({ error: `接続エラー: ${error.message}` });
+    // 接続エラーの場合、ユーザーデータも作成しない
+    console.error(`${cleanUsername}: ユーザー追加失敗`, error);
+    
+    // エラーの種類に応じたメッセージ
+    let errorMessage = `接続エラー: ${error.message}`;
+    if (error.message.includes('LIVE has ended')) {
+      errorMessage = `${cleanUsername} は現在ライブ配信をしていません`;
+    } else if (error.message.includes('UserOfflineError')) {
+      errorMessage = `${cleanUsername} はオフラインです`;
+    }
+    
+    res.status(500).json({ error: errorMessage });
   }
 });
 
