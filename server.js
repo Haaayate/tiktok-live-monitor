@@ -1,4 +1,4 @@
-// server.js - TikTokライブ監視バックエンド
+// server.js - TikTokライブ監視バックエンド（修正版）
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -43,6 +43,21 @@ io.on('connection', (socket) => {
   });
 });
 
+// 初期ユーザーデータ作成関数
+function createInitialUserData(username) {
+  return {
+    username: username,
+    isLive: true,
+    viewerCount: 0,
+    totalComments: 0,
+    totalGifts: 0,
+    totalDiamonds: 0,
+    lastUpdate: new Date().toISOString(),
+    recentComments: [],
+    recentGifts: []
+  };
+}
+
 // TikTokライブ接続関数
 async function connectToTikTokLive(username) {
   try {
@@ -55,21 +70,12 @@ async function connectToTikTokLive(username) {
       console.log(`${username}: 接続成功`);
       
       // 初期データ設定
-      liveData.set(username, {
-        username: username,
-        isLive: true,
-        viewerCount: 0,
-        totalComments: 0,
-        totalGifts: 0,
-        totalDiamonds: 0,
-        lastUpdate: new Date().toISOString(),
-        recentComments: [],
-        recentGifts: []
-      });
+      const initialData = createInitialUserData(username);
+      liveData.set(username, initialData);
       
       // データをクライアントに送信
       io.emit('user-connected', { username, status: 'connected' });
-      io.emit('live-data-update', { username, data: liveData.get(username) });
+      io.emit('live-data-update', { username, data: initialData });
     }).catch(err => {
       console.error(`${username}: 接続エラー`, err);
       io.emit('user-error', { username, error: err.message });
@@ -77,86 +83,118 @@ async function connectToTikTokLive(username) {
 
     // コメントイベント
     tiktokLiveConnection.on('comment', data => {
-      const userData = liveData.get(username);
-      userData.totalComments++;
-      userData.recentComments.unshift({
-        user: data.nickname,
-        comment: data.comment,
-        timestamp: new Date().toISOString()
-      });
-      
-      // 最新10件のコメントのみ保持
-      userData.recentComments = userData.recentComments.slice(0, 10);
-      userData.lastUpdate = new Date().toISOString();
-      
-      liveData.set(username, userData);
-      
-      // リアルタイム送信
-      io.emit('new-comment', { username, data: {
-        user: data.nickname,
-        comment: data.comment,
-        timestamp: userData.lastUpdate
-      }});
-      io.emit('live-data-update', { username, data: userData });
+      try {
+        let userData = liveData.get(username);
+        if (!userData) {
+          userData = createInitialUserData(username);
+        }
+        
+        userData.totalComments++;
+        userData.recentComments.unshift({
+          user: data.nickname,
+          comment: data.comment,
+          timestamp: new Date().toISOString()
+        });
+        
+        // 最新10件のコメントのみ保持
+        userData.recentComments = userData.recentComments.slice(0, 10);
+        userData.lastUpdate = new Date().toISOString();
+        
+        liveData.set(username, userData);
+        
+        // リアルタイム送信
+        io.emit('new-comment', { username, data: {
+          user: data.nickname,
+          comment: data.comment,
+          timestamp: userData.lastUpdate
+        }});
+        io.emit('live-data-update', { username, data: userData });
+      } catch (error) {
+        console.error(`${username}: コメント処理エラー`, error);
+      }
     });
 
     // ギフトイベント
     tiktokLiveConnection.on('gift', data => {
-      const userData = liveData.get(username);
-      userData.totalGifts++;
-      
-      // ダイヤモンド計算（概算）
-      const diamondValue = data.giftDetails?.diamond_count || data.repeatCount || 1;
-      userData.totalDiamonds += diamondValue;
-      
-      userData.recentGifts.unshift({
-        user: data.nickname,
-        giftName: data.giftDetails?.name || 'Unknown Gift',
-        giftId: data.giftId,
-        count: data.repeatCount,
-        diamonds: diamondValue,
-        timestamp: new Date().toISOString()
-      });
-      
-      // 最新10件のギフトのみ保持
-      userData.recentGifts = userData.recentGifts.slice(0, 10);
-      userData.lastUpdate = new Date().toISOString();
-      
-      liveData.set(username, userData);
-      
-      // リアルタイム送信
-      io.emit('new-gift', { username, data: userData.recentGifts[0] });
-      io.emit('live-data-update', { username, data: userData });
+      try {
+        let userData = liveData.get(username);
+        if (!userData) {
+          userData = createInitialUserData(username);
+        }
+        
+        userData.totalGifts++;
+        
+        // ダイヤモンド計算（概算）
+        const diamondValue = data.giftDetails?.diamond_count || data.repeatCount || 1;
+        userData.totalDiamonds += diamondValue;
+        
+        userData.recentGifts.unshift({
+          user: data.nickname,
+          giftName: data.giftDetails?.name || 'Unknown Gift',
+          giftId: data.giftId,
+          count: data.repeatCount,
+          diamonds: diamondValue,
+          timestamp: new Date().toISOString()
+        });
+        
+        // 最新10件のギフトのみ保持
+        userData.recentGifts = userData.recentGifts.slice(0, 10);
+        userData.lastUpdate = new Date().toISOString();
+        
+        liveData.set(username, userData);
+        
+        // リアルタイム送信
+        io.emit('new-gift', { username, data: userData.recentGifts[0] });
+        io.emit('live-data-update', { username, data: userData });
+      } catch (error) {
+        console.error(`${username}: ギフト処理エラー`, error);
+      }
     });
 
-    // 視聴者数更新
+    // 視聴者数更新（修正版）
     tiktokLiveConnection.on('roomUser', data => {
-      const userData = liveData.get(username);
-      userData.viewerCount = data.viewerCount || 0;
-      userData.lastUpdate = new Date().toISOString();
-      
-      liveData.set(username, userData);
-      io.emit('live-data-update', { username, data: userData });
+      try {
+        let userData = liveData.get(username);
+        if (!userData) {
+          userData = createInitialUserData(username);
+        }
+        
+        userData.viewerCount = data.viewerCount || 0;
+        userData.lastUpdate = new Date().toISOString();
+        
+        liveData.set(username, userData);
+        io.emit('live-data-update', { username, data: userData });
+      } catch (error) {
+        console.error(`${username}: 視聴者数更新エラー`, error);
+      }
     });
 
     // フォローイベント
     tiktokLiveConnection.on('follow', data => {
-      io.emit('new-follow', { username, data: {
-        user: data.nickname,
-        timestamp: new Date().toISOString()
-      }});
+      try {
+        io.emit('new-follow', { username, data: {
+          user: data.nickname,
+          timestamp: new Date().toISOString()
+        }});
+      } catch (error) {
+        console.error(`${username}: フォロー処理エラー`, error);
+      }
     });
 
     // 切断イベント
     tiktokLiveConnection.on('disconnected', () => {
       console.log(`${username}: 切断`);
-      const userData = liveData.get(username);
-      if (userData) {
-        userData.isLive = false;
-        userData.lastUpdate = new Date().toISOString();
-        liveData.set(username, userData);
+      try {
+        const userData = liveData.get(username);
+        if (userData) {
+          userData.isLive = false;
+          userData.lastUpdate = new Date().toISOString();
+          liveData.set(username, userData);
+        }
+        io.emit('user-disconnected', { username });
+      } catch (error) {
+        console.error(`${username}: 切断処理エラー`, error);
       }
-      io.emit('user-disconnected', { username });
     });
 
     // エラーイベント
@@ -286,6 +324,15 @@ app.get('/api/live-data', (req, res) => {
   res.json(Object.fromEntries(liveData));
 });
 
+// ルート設定
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'TikTok Live Monitor API',
+    timestamp: new Date().toISOString(),
+    version: '1.0.0'
+  });
+});
+
 // ヘルスチェック
 app.get('/health', (req, res) => {
   res.json({ 
@@ -298,8 +345,26 @@ app.get('/health', (req, res) => {
 
 // サーバー起動
 const PORT = process.env.PORT || 10000;
+
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`TikTokライブ監視サーバーが起動しました: ポート ${PORT}`);
+  console.log(`=== TikTok Live Monitor Server ===`);
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Timestamp: ${new Date().toISOString()}`);
+  console.log(`Health check: /health`);
+  console.log(`API Base: /api`);
+});
+
+// エラーハンドリング
+server.on('error', (err) => {
+  console.error('Server error:', err);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err);
 });
 
 // 終了時の処理
