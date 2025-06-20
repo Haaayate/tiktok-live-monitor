@@ -297,9 +297,9 @@ app.get('/health', (req, res) => {
 });
 
 // サーバー起動
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`TikTokライブ監視サーバーが起動しました: http://localhost:${PORT}`);
+const PORT = process.env.PORT || 10000;
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`TikTokライブ監視サーバーが起動しました: ポート ${PORT}`);
 });
 
 // 終了時の処理
