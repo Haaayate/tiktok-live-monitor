@@ -362,45 +362,56 @@ app.get('/health', (req, res) => {
   });
 });
 
-// 定期的なライブ状態チェック（5分ごと）
+// 定期的なライブ状態チェック（3分ごと）
 setInterval(() => {
-  checkOfflineUsers();
-}, 5 * 60 * 1000);
+  checkLiveStatus();
+}, 3 * 60 * 1000);
 
-// オフラインユーザーチェック関数
-function checkOfflineUsers() {
-  const now = new Date();
+// ライブ状態チェック関数
+async function checkLiveStatus() {
+  console.log('=== ライブ状態チェック開始 ===');
   
-  liveData.forEach((userData, username) => {
+  for (const [username, userData] of liveData) {
     if (userData.isLive) {
-      const lastUpdate = new Date(userData.lastUpdate);
-      const timeDiff = (now - lastUpdate) / (1000 * 60); // 分単位
-      
-      // 10分間更新がない場合はオフライン判定
-      if (timeDiff > 10) {
-        console.log(`${username}: 10分間更新なし、オフライン判定`);
-        userData.isLive = false;
-        userData.lastUpdate = now.toISOString();
-        liveData.set(username, userData);
+      try {
+        // 新しい接続を試して確認
+        const testConnection = new WebcastPushConnection(username, {
+          enableExtendedGiftInfo: false,
+        });
         
-        // フロントエンドに通知
-        io.emit('user-disconnected', { username });
-        io.emit('live-data-update', { username, data: userData });
-      }
-      
-      // 視聴者数が0で5分経過した場合もオフライン判定
-      else if (userData.viewerCount === 0 && timeDiff > 5) {
-        console.log(`${username}: 視聴者数0で5分経過、オフライン判定`);
-        userData.isLive = false;
-        userData.lastUpdate = now.toISOString();
-        liveData.set(username, userData);
+        await testConnection.connect();
+        console.log(`${username}: ライブ配信中を確認`);
         
-        // フロントエンドに通知
-        io.emit('user-disconnected', { username });
-        io.emit('live-data-update', { username, data: userData });
+        // 接続成功した場合はライブ中なので何もしない
+        testConnection.disconnect();
+        
+      } catch (error) {
+        if (error.message.includes('LIVE has ended') || error.message.includes('UserOfflineError')) {
+          console.log(`${username}: ライブ終了を検出、オフライン設定`);
+          
+          // オフライン設定
+          userData.isLive = false;
+          userData.lastUpdate = new Date().toISOString();
+          liveData.set(username, userData);
+          
+          // 既存の接続があれば切断
+          const existingConnection = connections.get(username);
+          if (existingConnection) {
+            existingConnection.disconnect();
+          }
+          
+          // フロントエンドに通知
+          io.emit('user-disconnected', { username });
+          io.emit('live-data-update', { username, data: userData });
+          
+        } else {
+          console.log(`${username}: チェック中にエラー`, error.message);
+        }
       }
     }
-  });
+  }
+  
+  console.log('=== ライブ状態チェック完了 ===');
 }
 
 // サーバー起動
