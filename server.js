@@ -362,6 +362,47 @@ app.get('/health', (req, res) => {
   });
 });
 
+// 定期的なライブ状態チェック（5分ごと）
+setInterval(() => {
+  checkOfflineUsers();
+}, 5 * 60 * 1000);
+
+// オフラインユーザーチェック関数
+function checkOfflineUsers() {
+  const now = new Date();
+  
+  liveData.forEach((userData, username) => {
+    if (userData.isLive) {
+      const lastUpdate = new Date(userData.lastUpdate);
+      const timeDiff = (now - lastUpdate) / (1000 * 60); // 分単位
+      
+      // 10分間更新がない場合はオフライン判定
+      if (timeDiff > 10) {
+        console.log(`${username}: 10分間更新なし、オフライン判定`);
+        userData.isLive = false;
+        userData.lastUpdate = now.toISOString();
+        liveData.set(username, userData);
+        
+        // フロントエンドに通知
+        io.emit('user-disconnected', { username });
+        io.emit('live-data-update', { username, data: userData });
+      }
+      
+      // 視聴者数が0で5分経過した場合もオフライン判定
+      else if (userData.viewerCount === 0 && timeDiff > 5) {
+        console.log(`${username}: 視聴者数0で5分経過、オフライン判定`);
+        userData.isLive = false;
+        userData.lastUpdate = now.toISOString();
+        liveData.set(username, userData);
+        
+        // フロントエンドに通知
+        io.emit('user-disconnected', { username });
+        io.emit('live-data-update', { username, data: userData });
+      }
+    }
+  });
+}
+
 // サーバー起動
 const PORT = process.env.PORT || 10000;
 
