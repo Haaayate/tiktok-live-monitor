@@ -58,6 +58,47 @@ function createInitialUserData(username) {
   };
 }
 
+// 単一ユーザーのライブ状態チェック関数
+async function checkSingleUserLiveStatus(username) {
+  try {
+    console.log(`${username}: 即座ライブ状態チェック開始`);
+    
+    // 新しい接続を試して確認
+    const testConnection = new WebcastPushConnection(username, {
+      enableExtendedGiftInfo: false,
+    });
+    
+    await testConnection.connect();
+    console.log(`${username}: ライブ配信中を確認（即座チェック）`);
+    
+    // 接続成功した場合はライブ中なので何もしない
+    testConnection.disconnect();
+    return true; // ライブ中
+    
+  } catch (error) {
+    if (error.message.includes('LIVE has ended') || error.message.includes('UserOfflineError')) {
+      console.log(`${username}: ライブ終了を検出（即座チェック）`);
+      
+      // liveDataが存在する場合はオフライン設定
+      const userData = liveData.get(username);
+      if (userData) {
+        userData.isLive = false;
+        userData.lastUpdate = new Date().toISOString();
+        liveData.set(username, userData);
+        
+        // フロントエンドに通知
+        io.emit('user-disconnected', { username });
+        io.emit('live-data-update', { username, data: userData });
+      }
+      
+      return false; // オフライン
+    } else {
+      console.log(`${username}: 即座チェック中にエラー`, error.message);
+      return null; // 不明
+    }
+  }
+}
+
 // TikTokライブ接続関数
 async function connectToTikTokLive(username) {
   try {
@@ -66,7 +107,7 @@ async function connectToTikTokLive(username) {
     });
 
     // 接続イベント
-    tiktokLiveConnection.connect().then(state => {
+    tiktokLiveConnection.connect().then(async state => {
       console.log(`${username}: 接続成功`);
       
       // 初期データ設定
@@ -76,6 +117,13 @@ async function connectToTikTokLive(username) {
       // データをクライアントに送信
       io.emit('user-connected', { username, status: 'connected' });
       io.emit('live-data-update', { username, data: initialData });
+      
+      // 接続成功後、5秒待ってから即座にライブ状態をチェック
+      setTimeout(async () => {
+        console.log(`${username}: 接続後の即座ライブ状態チェック開始`);
+        await checkSingleUserLiveStatus(username);
+      }, 5000);
+      
     }).catch(err => {
       console.error(`${username}: 接続エラー`, err);
       
@@ -245,6 +293,14 @@ app.post('/api/add-user', async (req, res) => {
       status: 'monitoring'
     });
     
+    console.log(`${cleanUsername}: ユーザー追加完了、即座ライブ状態チェックを開始します`);
+    
+    // ユーザー追加後、10秒待ってから即座にライブ状態をチェック
+    setTimeout(async () => {
+      console.log(`${cleanUsername}: ユーザー追加後の即座ライブ状態チェック`);
+      await checkSingleUserLiveStatus(cleanUsername);
+    }, 10000);
+    
     res.json({ message: `${cleanUsername} の監視を開始しました` });
   } catch (error) {
     // 接続エラーの場合、ユーザーデータも作成しない
@@ -317,6 +373,13 @@ app.post('/api/upload-csv', upload.single('csvfile'), (req, res) => {
               addedAt: new Date().toISOString(),
               status: 'monitoring'
             });
+            
+            // CSV追加後も即座ライブ状態チェック（15秒待機）
+            setTimeout(async () => {
+              console.log(`${username}: CSV追加後の即座ライブ状態チェック`);
+              await checkSingleUserLiveStatus(username);
+            }, 15000);
+            
           } catch (error) {
             errors.push(`${username}: ${error.message}`);
           }
