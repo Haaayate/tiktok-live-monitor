@@ -4,6 +4,9 @@ const http = require('http');
 const socketIo = require('socket.io');
 const { WebcastPushConnection } = require('tiktok-live-connector');
 const cors = require('cors');
+const multer = require('multer');
+const csv = require('csv-parser');
+const fs = require('fs');
 const path = require('path');
 const { Pool } = require('pg');
 
@@ -26,6 +29,9 @@ const pool = new Pool({
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
+
+// ファイルアップロード設定
+const upload = multer({ dest: 'uploads/' });
 
 // データストレージ（メモリ + DB）
 let connections = new Map(); // username -> WebcastPushConnection
@@ -484,9 +490,102 @@ app.post('/api/remove-user', async (req, res) => {
   }
 });
 
-// CSV一括追加（一時的に無効化）
-app.post('/api/upload-csv', (req, res) => {
-  res.status(503).json({ error: 'CSV機能は一時的に無効化されています' });
+// CSV一括追加（データベース対応版）
+app.post('/api/upload-csv', upload.single('csvfile'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'CSVファイルが必要です' });
+  }
+  
+  const results = [];
+  const errors = [];
+  const successUsers = [];
+  
+  try {
+    // CSVファイルを読み込み
+    const csvData = await new Promise((resolve, reject) => {
+      const data = [];
+      fs.createReadStream(req.file.path)
+        .pipe(csv())
+        .on('data', (row) => {
+          // CSVの最初の列をユーザー名として扱う
+          const username = Object.values(row)[0];
+          if (username && username.trim()) {
+            data.push(username.replace('@', '').trim());
+          }
+        })
+        .on('end', () => resolve(data))
+        .on('error', reject);
+    });
+    
+    // アップロードファイルを削除
+    fs.unlinkSync(req.file.path);
+    
+    console.log(`CSV一括登録: ${csvData.length}件のユーザーを処理開始`);
+    
+    // 各ユーザーに対して処理
+    for (const username of csvData) {
+      try {
+        // データベースで重複チェック
+        const existingUser = await pool.query(
+          'SELECT username FROM users WHERE username = $1', 
+          [username]
+        );
+        
+        if (existingUser.rows.length > 0) {
+          errors.push(`${username}: 既に監視中です`);
+          continue;
+        }
+        
+        // TikTok接続を試行
+        await connectToTikTokLive(username);
+        successUsers.push(username);
+        
+        console.log(`${username}: CSV経由で追加成功`);
+        
+        // 即座ライブ状態チェック（非同期で実行）
+        setTimeout(async () => {
+          console.log(`${username}: CSV追加後の即座ライブ状態チェック`);
+          await checkSingleUserLiveStatus(username);
+        }, 15000 + (successUsers.length * 1000)); // 時間差を設けて負荷分散
+        
+      } catch (error) {
+        console.error(`${username}: CSV追加エラー - ${error.message}`);
+        
+        // エラーメッセージを分かりやすく
+        let errorMessage = error.message;
+        if (error.message.includes('LIVE has ended')) {
+          errorMessage = '現在ライブ配信していません';
+        } else if (error.message.includes('UserOfflineError')) {
+          errorMessage = 'オフラインです';
+        }
+        
+        errors.push(`${username}: ${errorMessage}`);
+      }
+    }
+    
+    // 結果を返す
+    const responseMessage = `${successUsers.length}件のユーザーを追加しました`;
+    console.log(`CSV一括登録完了: ${responseMessage}`);
+    
+    res.json({ 
+      message: responseMessage,
+      success: successUsers.length,
+      total: csvData.length,
+      errors: errors.length > 0 ? errors : undefined
+    });
+    
+  } catch (error) {
+    console.error('CSV処理エラー:', error);
+    
+    // ファイルが残っている場合は削除
+    if (fs.existsSync(req.file.path)) {
+      fs.unlinkSync(req.file.path);
+    }
+    
+    res.status(500).json({ 
+      error: 'CSVファイルの処理中にエラーが発生しました: ' + error.message 
+    });
+  }
 });
 
 // 監視ユーザー一覧取得
