@@ -1,4 +1,92 @@
-// server.js - TikTokライブ監視バックエンド（PostgreSQL + CSV完全版）
+// 接続キュー処理
+async function processConnectionQueue() {
+  if (connectionQueue.length === 0) return;
+  if (connections.size >= MAX_CONCURRENT_CONNECTIONS) return;
+  
+  const username = connectionQueue.shift();
+  console.log(`キューから接続処理: ${username}`);
+  
+  try {
+    await connectToTikTokLive(username);
+    
+    // データベースのステータスを更新
+    await pool.query(`
+      UPDATE users SET status = 'monitoring', updated_at = CURRENT_TIMESTAMP
+      WHERE username = $1
+    `, [username]);
+    
+    console.log(`${username}: キューからの接続成功`);
+    
+    // 通知送信
+    io.emit('user-connected', { username, status: 'connected' });
+    
+    // 次のキューを処理
+    setTimeout(() => {
+      processConnectionQueue();
+    }, CONNECTION_RETRY_DELAY);
+    
+  } catch (error) {
+    console.error(`${username}: キューからの接続失敗`, error);
+    
+    // 失敗した場合は再度キューに追加
+    connectionQueue.push(username);
+  }
+}
+
+// 定期的なキュー処理
+setInterval(() => {
+  processConnectionQueue();
+}, 30000); // 30秒ごと
+app.post('/api/add-user', async (req, res) => {
+  const { username } = req.body;
+  
+  if (!username) {
+    return res.status(400).json({ error: 'ユーザー名が必要です' });
+  }
+  
+  const cleanUsername = username.replace('@', '');
+  
+  try {
+    // データベースで重複チェック
+    const existingUser = await pool.query('SELECT username FROM users WHERE username = $1', [cleanUsername]);
+    if (existingUser.rows.length > 0) {
+      return res.status(400).json({ error: 'このユーザーは既に監視中です' });
+    }
+    
+    // 接続数制限チェック
+    if (connections.size >= MAX_CONCURRENT_CONNECTIONS) {
+      // データベースには追加するが、接続は待機
+      await pool.query(`
+        INSERT INTO users (username, status, is_live)
+        VALUES ($1, 'waiting', false)
+      `, [cleanUsername]);
+      
+      connectionQueue.push(cleanUsername);
+      
+      return res.json({ 
+        message: `${cleanUsername} を追加しました（接続待機中: ${connectionQueue.length}番目）`,
+        status: 'waiting'
+      });
+    }
+    
+    await connectToTikTokLive(cleanUsername);
+    
+    console.log(`${cleanUsername}: ユーザー追加完了、即座ライブ状態チェックを開始します`);
+    
+    setTimeout(async () => {
+      console.log(`${cleanUsername}: ユーザー追加後の即座ライブ状態チェック`);
+      await checkSingleUserLiveStatus(cleanUsername);
+    }, 10000);
+    
+    res.json({ 
+      message: `${cleanUsername} の監視を開始しました`,
+      status: 'active'
+    });
+  } catch (error) {
+    console.error(`${cleanUsername}: ユーザー追加失敗`, error);
+    
+    let errorMessage = `接続エラー: ${error.message}`;
+    if (error.message.includes('// server.js - TikTokライブ監視バックエンド（PostgreSQL + CSV完全版）
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -33,9 +121,14 @@ app.use(express.static('public'));
 // ファイルアップロード設定
 const upload = multer({ dest: 'uploads/' });
 
+// 接続管理設定
+const MAX_CONCURRENT_CONNECTIONS = 25; // 最大同時接続数を25に設定
+const CONNECTION_RETRY_DELAY = 5000; // 接続リトライ間隔
+
 // データストレージ（メモリ + DB）
 let connections = new Map();
 let liveData = new Map();
+let connectionQueue = []; // 接続待機キュー
 
 // データベース初期化
 async function initializeDatabase() {
@@ -460,7 +553,7 @@ app.post('/api/add-user', async (req, res) => {
   }
 });
 
-// ユーザー削除
+// ユーザー削除（接続解放対応）
 app.post('/api/remove-user', async (req, res) => {
   const { username } = req.body;
   const cleanUsername = username.replace('@', '');
@@ -478,12 +571,29 @@ app.post('/api/remove-user', async (req, res) => {
     if (connection) {
       connection.disconnect();
       connections.delete(cleanUsername);
+      console.log(`${cleanUsername}: 接続解放 (残り${connections.size})`);
     }
     
     liveData.delete(cleanUsername);
     
+    // キューから削除（もしある場合）
+    const queueIndex = connectionQueue.indexOf(cleanUsername);
+    if (queueIndex !== -1) {
+      connectionQueue.splice(queueIndex, 1);
+    }
+    
     io.emit('user-removed', { username: cleanUsername });
-    res.json({ message: `${cleanUsername} の監視を停止しました` });
+    
+    // 接続枠が空いたのでキューを処理
+    setTimeout(() => {
+      processConnectionQueue();
+    }, 1000);
+    
+    res.json({ 
+      message: `${cleanUsername} の監視を停止しました`,
+      activeConnections: connections.size,
+      queueLength: connectionQueue.length
+    });
   } catch (error) {
     console.error(`${cleanUsername}: 削除エラー`, error);
     res.status(500).json({ error: '削除に失敗しました' });
@@ -587,6 +697,27 @@ app.post('/api/upload-csv', upload.single('csvfile'), async (req, res) => {
   }
 });
 
+// 接続状況確認API
+app.get('/api/connection-status', async (req, res) => {
+  try {
+    const totalUsers = await pool.query('SELECT COUNT(*) FROM users');
+    const activeUsers = await pool.query('SELECT COUNT(*) FROM users WHERE status = \'monitoring\'');
+    const waitingUsers = await pool.query('SELECT COUNT(*) FROM users WHERE status = \'waiting\'');
+    
+    res.json({
+      totalUsers: parseInt(totalUsers.rows[0].count),
+      activeUsers: parseInt(activeUsers.rows[0].count),
+      waitingUsers: parseInt(waitingUsers.rows[0].count),
+      activeConnections: connections.size,
+      queueLength: connectionQueue.length,
+      maxConnections: MAX_CONCURRENT_CONNECTIONS,
+      availableSlots: MAX_CONCURRENT_CONNECTIONS - connections.size
+    });
+  } catch (error) {
+    res.status(500).json({ error: '接続状況の取得に失敗しました' });
+  }
+});
+
 // 手動ライブ状態チェック
 app.post('/api/check-live-status', async (req, res) => {
   try {
@@ -686,14 +817,19 @@ app.get('/health', async (req, res) => {
     await pool.query('SELECT 1');
     
     const userCount = await pool.query('SELECT COUNT(*) FROM users WHERE status = \'monitoring\'');
+    const waitingCount = await pool.query('SELECT COUNT(*) FROM users WHERE status = \'waiting\'');
     
     res.json({ 
       status: 'OK', 
       timestamp: new Date().toISOString(),
       database: 'connected',
       monitoredUsers: parseInt(userCount.rows[0].count),
+      waitingUsers: parseInt(waitingCount.rows[0].count),
       activeConnections: connections.size,
-      features: ['postgresql', 'csv-upload', 'auto-restore']
+      queueLength: connectionQueue.length,
+      maxConnections: MAX_CONCURRENT_CONNECTIONS,
+      availableSlots: MAX_CONCURRENT_CONNECTIONS - connections.size,
+      features: ['postgresql', 'csv-upload', 'auto-restore', 'connection-management']
     });
   } catch (error) {
     res.status(500).json({
