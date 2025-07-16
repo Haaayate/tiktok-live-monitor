@@ -1,92 +1,4 @@
-// 接続キュー処理
-async function processConnectionQueue() {
-  if (connectionQueue.length === 0) return;
-  if (connections.size >= MAX_CONCURRENT_CONNECTIONS) return;
-  
-  const username = connectionQueue.shift();
-  console.log(`キューから接続処理: ${username}`);
-  
-  try {
-    await connectToTikTokLive(username);
-    
-    // データベースのステータスを更新
-    await pool.query(`
-      UPDATE users SET status = 'monitoring', updated_at = CURRENT_TIMESTAMP
-      WHERE username = $1
-    `, [username]);
-    
-    console.log(`${username}: キューからの接続成功`);
-    
-    // 通知送信
-    io.emit('user-connected', { username, status: 'connected' });
-    
-    // 次のキューを処理
-    setTimeout(() => {
-      processConnectionQueue();
-    }, CONNECTION_RETRY_DELAY);
-    
-  } catch (error) {
-    console.error(`${username}: キューからの接続失敗`, error);
-    
-    // 失敗した場合は再度キューに追加
-    connectionQueue.push(username);
-  }
-}
-
-// 定期的なキュー処理
-setInterval(() => {
-  processConnectionQueue();
-}, 30000); // 30秒ごと
-app.post('/api/add-user', async (req, res) => {
-  const { username } = req.body;
-  
-  if (!username) {
-    return res.status(400).json({ error: 'ユーザー名が必要です' });
-  }
-  
-  const cleanUsername = username.replace('@', '');
-  
-  try {
-    // データベースで重複チェック
-    const existingUser = await pool.query('SELECT username FROM users WHERE username = $1', [cleanUsername]);
-    if (existingUser.rows.length > 0) {
-      return res.status(400).json({ error: 'このユーザーは既に監視中です' });
-    }
-    
-    // 接続数制限チェック
-    if (connections.size >= MAX_CONCURRENT_CONNECTIONS) {
-      // データベースには追加するが、接続は待機
-      await pool.query(`
-        INSERT INTO users (username, status, is_live)
-        VALUES ($1, 'waiting', false)
-      `, [cleanUsername]);
-      
-      connectionQueue.push(cleanUsername);
-      
-      return res.json({ 
-        message: `${cleanUsername} を追加しました（接続待機中: ${connectionQueue.length}番目）`,
-        status: 'waiting'
-      });
-    }
-    
-    await connectToTikTokLive(cleanUsername);
-    
-    console.log(`${cleanUsername}: ユーザー追加完了、即座ライブ状態チェックを開始します`);
-    
-    setTimeout(async () => {
-      console.log(`${cleanUsername}: ユーザー追加後の即座ライブ状態チェック`);
-      await checkSingleUserLiveStatus(cleanUsername);
-    }, 10000);
-    
-    res.json({ 
-      message: `${cleanUsername} の監視を開始しました`,
-      status: 'active'
-    });
-  } catch (error) {
-    console.error(`${cleanUsername}: ユーザー追加失敗`, error);
-    
-    let errorMessage = `接続エラー: ${error.message}`;
-    if (error.message.includes('// server.js - TikTokライブ監視バックエンド（PostgreSQL + CSV完全版）
+// server.js - TikTokライブ監視バックエンド（PostgreSQL + CSV完全版）
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -191,9 +103,9 @@ async function restoreExistingUsers() {
     
     const result = await pool.query(`
       SELECT username, total_diamonds, total_gifts, total_comments, 
-             is_live, viewer_count, last_live_check
+             is_live, viewer_count, last_live_check, status
       FROM users 
-      WHERE status = 'monitoring'
+      WHERE status IN ('monitoring', 'waiting')
       ORDER BY added_at ASC
     `);
     
@@ -213,21 +125,71 @@ async function restoreExistingUsers() {
         recentGifts: []
       });
       
-      // TikTok接続を復元（エラーが発生してもスキップ）
-      try {
-        await connectToTikTokLive(user.username);
-        console.log(`${user.username}: 接続復元成功`);
-      } catch (error) {
-        console.log(`${user.username}: 接続復元失敗 - ${error.message}`);
+      // 接続数制限チェック
+      if (user.status === 'monitoring' && connections.size < MAX_CONCURRENT_CONNECTIONS) {
+        try {
+          await connectToTikTokLive(user.username);
+          console.log(`${user.username}: 接続復元成功`);
+        } catch (error) {
+          console.log(`${user.username}: 接続復元失敗 - ${error.message}`);
+          // 接続失敗時は待機キューに追加
+          connectionQueue.push(user.username);
+          await pool.query('UPDATE users SET status = $1 WHERE username = $2', ['waiting', user.username]);
+        }
+      } else {
+        // 接続制限により待機キューに追加
+        connectionQueue.push(user.username);
+        await pool.query('UPDATE users SET status = $1 WHERE username = $2', ['waiting', user.username]);
       }
     }
     
     console.log('既存ユーザーの復元完了');
+    console.log(`アクティブ接続: ${connections.size}, 待機キュー: ${connectionQueue.length}`);
     
   } catch (error) {
     console.error('ユーザー復元エラー:', error);
   }
 }
+
+// 接続キュー処理
+async function processConnectionQueue() {
+  if (connectionQueue.length === 0) return;
+  if (connections.size >= MAX_CONCURRENT_CONNECTIONS) return;
+  
+  const username = connectionQueue.shift();
+  console.log(`キューから接続処理: ${username}`);
+  
+  try {
+    await connectToTikTokLive(username);
+    
+    // データベースのステータスを更新
+    await pool.query(`
+      UPDATE users SET status = 'monitoring', updated_at = CURRENT_TIMESTAMP
+      WHERE username = $1
+    `, [username]);
+    
+    console.log(`${username}: キューからの接続成功`);
+    
+    // 通知送信
+    io.emit('user-connected', { username, status: 'connected' });
+    
+    // 次のキューを処理
+    setTimeout(() => {
+      processConnectionQueue();
+    }, CONNECTION_RETRY_DELAY);
+    
+  } catch (error) {
+    console.error(`${username}: キューからの接続失敗`, error);
+    
+    // 失敗した場合は再度キューに追加
+    connectionQueue.push(username);
+  }
+}
+
+// 定期的なキュー処理
+setInterval(() => {
+  processConnectionQueue();
+}, 30000); // 30秒ごと
 
 // Socket.io接続管理
 io.on('connection', (socket) => {
@@ -512,7 +474,7 @@ async function connectToTikTokLive(username) {
 
 // API エンドポイント
 
-// ユーザー追加
+// ユーザー追加（接続数制限対応）
 app.post('/api/add-user', async (req, res) => {
   const { username } = req.body;
   
@@ -529,6 +491,22 @@ app.post('/api/add-user', async (req, res) => {
       return res.status(400).json({ error: 'このユーザーは既に監視中です' });
     }
     
+    // 接続数制限チェック
+    if (connections.size >= MAX_CONCURRENT_CONNECTIONS) {
+      // データベースには追加するが、接続は待機
+      await pool.query(`
+        INSERT INTO users (username, status, is_live)
+        VALUES ($1, 'waiting', false)
+      `, [cleanUsername]);
+      
+      connectionQueue.push(cleanUsername);
+      
+      return res.json({ 
+        message: `${cleanUsername} を追加しました（接続待機中: ${connectionQueue.length}番目）`,
+        status: 'waiting'
+      });
+    }
+    
     await connectToTikTokLive(cleanUsername);
     
     console.log(`${cleanUsername}: ユーザー追加完了、即座ライブ状態チェックを開始します`);
@@ -538,7 +516,10 @@ app.post('/api/add-user', async (req, res) => {
       await checkSingleUserLiveStatus(cleanUsername);
     }, 10000);
     
-    res.json({ message: `${cleanUsername} の監視を開始しました` });
+    res.json({ 
+      message: `${cleanUsername} の監視を開始しました`,
+      status: 'active'
+    });
   } catch (error) {
     console.error(`${cleanUsername}: ユーザー追加失敗`, error);
     
@@ -608,6 +589,7 @@ app.post('/api/upload-csv', upload.single('csvfile'), async (req, res) => {
   
   const errors = [];
   const successUsers = [];
+  const waitingUsers = [];
   
   try {
     // CSVファイルを読み込み
@@ -645,17 +627,31 @@ app.post('/api/upload-csv', upload.single('csvfile'), async (req, res) => {
           continue;
         }
         
-        // TikTok接続を試行
-        await connectToTikTokLive(username);
-        successUsers.push(username);
-        
-        console.log(`${username}: CSV経由で追加成功`);
-        
-        // 即座ライブ状態チェック（非同期で実行）
-        setTimeout(async () => {
-          console.log(`${username}: CSV追加後の即座ライブ状態チェック`);
-          await checkSingleUserLiveStatus(username);
-        }, 15000 + (successUsers.length * 1000)); // 時間差を設けて負荷分散
+        // 接続数制限チェック
+        if (connections.size >= MAX_CONCURRENT_CONNECTIONS) {
+          // データベースには追加するが、接続は待機
+          await pool.query(`
+            INSERT INTO users (username, status, is_live)
+            VALUES ($1, 'waiting', false)
+          `, [username]);
+          
+          connectionQueue.push(username);
+          waitingUsers.push(username);
+          
+          console.log(`${username}: CSV経由で追加（待機キュー）`);
+        } else {
+          // TikTok接続を試行
+          await connectToTikTokLive(username);
+          successUsers.push(username);
+          
+          console.log(`${username}: CSV経由で追加成功`);
+          
+          // 即座ライブ状態チェック（非同期で実行）
+          setTimeout(async () => {
+            console.log(`${username}: CSV追加後の即座ライブ状態チェック`);
+            await checkSingleUserLiveStatus(username);
+          }, 15000 + (successUsers.length * 1000)); // 時間差を設けて負荷分散
+        }
         
       } catch (error) {
         console.error(`${username}: CSV追加エラー - ${error.message}`);
@@ -673,12 +669,17 @@ app.post('/api/upload-csv', upload.single('csvfile'), async (req, res) => {
     }
     
     // 結果を返す
-    const responseMessage = `${successUsers.length}件のユーザーを追加しました`;
+    let responseMessage = `${successUsers.length}件のユーザーを追加しました`;
+    if (waitingUsers.length > 0) {
+      responseMessage += `（${waitingUsers.length}件は接続待機中）`;
+    }
+    
     console.log(`CSV一括登録完了: ${responseMessage}`);
     
     res.json({ 
       message: responseMessage,
       success: successUsers.length,
+      waiting: waitingUsers.length,
       total: csvData.length,
       errors: errors.length > 0 ? errors : undefined
     });
@@ -741,7 +742,7 @@ app.get('/api/users', async (req, res) => {
       SELECT username, added_at, status, total_diamonds, total_gifts, 
              total_comments, is_live, viewer_count, last_live_check
       FROM users 
-      WHERE status = 'monitoring'
+      WHERE status IN ('monitoring', 'waiting')
       ORDER BY added_at ASC
     `);
     
@@ -786,7 +787,7 @@ app.get('/api/ranking', async (req, res) => {
     
     res.json({
       ranking: dailyRanking,
-      totalUsers: await pool.query('SELECT COUNT(*) FROM users WHERE status = \'monitoring\'').then(r => parseInt(r.rows[0].count)),
+      totalUsers: await pool.query('SELECT COUNT(*) FROM users WHERE status IN (\'monitoring\', \'waiting\')').then(r => parseInt(r.rows[0].count)),
       activeUsers: dailyRanking.length,
       lastUpdate: new Date().toISOString()
     });
@@ -804,9 +805,9 @@ app.get('/api/live-data', (req, res) => {
 // ルート設定
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'TikTok Live Monitor API with PostgreSQL + CSV',
+    status: 'TikTok Live Monitor API with PostgreSQL + CSV + Connection Management',
     timestamp: new Date().toISOString(),
-    version: '2.1.0'
+    version: '2.2.0'
   });
 });
 
@@ -974,10 +975,11 @@ const PORT = process.env.PORT || 10000;
 // データベース初期化後にサーバー起動
 initializeDatabase().then(() => {
   server.listen(PORT, '0.0.0.0', () => {
-    console.log(`=== TikTok Live Monitor Server (PostgreSQL + CSV) ===`);
+    console.log(`=== TikTok Live Monitor Server (Connection Management) ===`);
     console.log(`Server running on port ${PORT}`);
+    console.log(`Max connections: ${MAX_CONCURRENT_CONNECTIONS}`);
     console.log(`Timestamp: ${new Date().toISOString()}`);
-    console.log(`Features: PostgreSQL, CSV Upload, Auto Restore`);
+    console.log(`Features: PostgreSQL, CSV Upload, Auto Restore, Connection Management`);
     console.log(`Health check: /health`);
     console.log(`API Base: /api`);
   });
