@@ -689,21 +689,23 @@ app.get('/health', async (req, res) => {
   }
 });
 
-// 定期的なライブ状態チェック（3分ごと）
+// 定期的なライブ状態チェック（1分ごと）
 setInterval(() => {
   checkLiveStatus();
-}, 3 * 60 * 1000);
+}, 1 * 60 * 1000); // 3分 → 1分に変更
 
 // 定期的な履歴保存（10分ごと）
 setInterval(() => {
   saveBulkLiveHistory();
 }, 10 * 60 * 1000);
 
-// ライブ状態チェック関数
+// 通知機能付きライブ状態チェック関数
 async function checkLiveStatus() {
   console.log('=== ライブ状態チェック開始 ===');
   
   for (const [username, userData] of liveData) {
+    const previousLiveStatus = userData.isLive;
+    
     if (userData.isLive) {
       try {
         const testConnection = new WebcastPushConnection(username, {
@@ -713,6 +715,11 @@ async function checkLiveStatus() {
         await testConnection.connect();
         console.log(`${username}: ライブ配信中を確認`);
         testConnection.disconnect();
+        
+        // まだライブ中の場合、最終更新時間を更新
+        userData.lastUpdate = new Date().toISOString();
+        liveData.set(username, userData);
+        await saveUserToDatabase(username, userData);
         
       } catch (error) {
         if (error.message.includes('LIVE has ended') || error.message.includes('UserOfflineError')) {
@@ -725,16 +732,67 @@ async function checkLiveStatus() {
           // データベースに保存
           await saveUserToDatabase(username, userData);
           
+          // 既存の接続を切断
           const existingConnection = connections.get(username);
           if (existingConnection) {
             existingConnection.disconnect();
           }
           
+          // ライブ終了通知を送信
           io.emit('user-disconnected', { username });
           io.emit('live-data-update', { username, data: userData });
+          io.emit('live-status-change', { 
+            username, 
+            status: 'offline',
+            timestamp: userData.lastUpdate,
+            message: `${username} がライブを終了しました`
+          });
           
         } else {
           console.log(`${username}: チェック中にエラー`, error.message);
+        }
+      }
+    } else {
+      // オフラインユーザーのライブ開始チェック
+      try {
+        const testConnection = new WebcastPushConnection(username, {
+          enableExtendedGiftInfo: false,
+        });
+        
+        await testConnection.connect();
+        console.log(`${username}: ライブ開始を検出！オンライン設定`);
+        testConnection.disconnect();
+        
+        // ライブ開始
+        userData.isLive = true;
+        userData.lastUpdate = new Date().toISOString();
+        liveData.set(username, userData);
+        
+        // データベースに保存
+        await saveUserToDatabase(username, userData);
+        
+        // 本格的なTikTok接続を再開
+        try {
+          await connectToTikTokLive(username);
+          console.log(`${username}: TikTok接続再開成功`);
+        } catch (reconnectError) {
+          console.error(`${username}: TikTok接続再開失敗`, reconnectError);
+        }
+        
+        // ライブ開始通知を送信
+        io.emit('user-connected', { username, status: 'connected' });
+        io.emit('live-data-update', { username, data: userData });
+        io.emit('live-status-change', { 
+          username, 
+          status: 'online',
+          timestamp: userData.lastUpdate,
+          message: `${username} がライブを開始しました`
+        });
+        
+      } catch (error) {
+        // まだオフラインのまま（正常）
+        if (!error.message.includes('LIVE has ended') && !error.message.includes('UserOfflineError')) {
+          console.log(`${username}: オフラインチェック中にエラー`, error.message);
         }
       }
     }
