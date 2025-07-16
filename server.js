@@ -4,9 +4,6 @@ const http = require('http');
 const socketIo = require('socket.io');
 const { WebcastPushConnection } = require('tiktok-live-connector');
 const cors = require('cors');
-const multer = require('multer');
-const csv = require('csv-parser');
-const fs = require('fs');
 const path = require('path');
 const { Pool } = require('pg');
 
@@ -29,9 +26,6 @@ const pool = new Pool({
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
-
-// ファイルアップロード設定
-const upload = multer({ dest: 'uploads/' });
 
 // データストレージ（メモリ + DB）
 let connections = new Map(); // username -> WebcastPushConnection
@@ -490,48 +484,9 @@ app.post('/api/remove-user', async (req, res) => {
   }
 });
 
-// CSV一括追加
-app.post('/api/upload-csv', upload.single('csvfile'), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: 'CSVファイルが必要です' });
-  }
-  
-  const results = [];
-  const errors = [];
-  
-  fs.createReadStream(req.file.path)
-    .pipe(csv())
-    .on('data', (data) => {
-      const username = Object.values(data)[0];
-      if (username) {
-        results.push(username.replace('@', ''));
-      }
-    })
-    .on('end', async () => {
-      fs.unlinkSync(req.file.path);
-      
-      for (const username of results) {
-        try {
-          // データベースで重複チェック
-          const existingUser = await pool.query('SELECT username FROM users WHERE username = $1', [username]);
-          if (existingUser.rows.length === 0) {
-            await connectToTikTokLive(username);
-            
-            setTimeout(async () => {
-              console.log(`${username}: CSV追加後の即座ライブ状態チェック`);
-              await checkSingleUserLiveStatus(username);
-            }, 15000);
-          }
-        } catch (error) {
-          errors.push(`${username}: ${error.message}`);
-        }
-      }
-      
-      res.json({ 
-        message: `${results.length - errors.length}件のユーザーを追加しました`,
-        errors: errors
-      });
-    });
+// CSV一括追加（一時的に無効化）
+app.post('/api/upload-csv', (req, res) => {
+  res.status(503).json({ error: 'CSV機能は一時的に無効化されています' });
 });
 
 // 監視ユーザー一覧取得
