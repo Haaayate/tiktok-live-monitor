@@ -587,6 +587,22 @@ app.post('/api/upload-csv', upload.single('csvfile'), async (req, res) => {
   }
 });
 
+// 手動ライブ状態チェック
+app.post('/api/check-live-status', async (req, res) => {
+  try {
+    console.log('手動ライブ状態チェック開始');
+    await checkLiveStatus();
+    
+    res.json({ 
+      message: 'ライブ状態チェックを実行しました',
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('手動ライブ状態チェックエラー:', error);
+    res.status(500).json({ error: 'ライブ状態チェックに失敗しました' });
+  }
+});
+
 // 監視ユーザー一覧取得
 app.get('/api/users', async (req, res) => {
   try {
