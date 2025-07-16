@@ -1,4 +1,4 @@
-// server.js - TikTokライブ監視バックエンド（修正版）
+// server.js - TikTokライブ監視バックエンド（PostgreSQL対応版）
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -8,6 +8,7 @@ const multer = require('multer');
 const csv = require('csv-parser');
 const fs = require('fs');
 const path = require('path');
+const { Pool } = require('pg');
 
 const app = express();
 const server = http.createServer(app);
@@ -18,6 +19,12 @@ const io = socketIo(server, {
   }
 });
 
+// PostgreSQL接続設定
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
+
 // ミドルウェア設定
 app.use(cors());
 app.use(express.json());
@@ -26,10 +33,108 @@ app.use(express.static('public'));
 // ファイルアップロード設定
 const upload = multer({ dest: 'uploads/' });
 
-// データストレージ（本番環境ではデータベース使用推奨）
-let monitoredUsers = new Map(); // username -> connection info
+// データストレージ（メモリ + DB）
 let connections = new Map(); // username -> WebcastPushConnection
 let liveData = new Map(); // username -> live stats
+
+// データベース初期化
+async function initializeDatabase() {
+  try {
+    console.log('データベース初期化開始...');
+    
+    // テーブル作成
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(255) UNIQUE NOT NULL,
+        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        status VARCHAR(50) DEFAULT 'monitoring',
+        total_diamonds INTEGER DEFAULT 0,
+        total_gifts INTEGER DEFAULT 0,
+        total_comments INTEGER DEFAULT 0,
+        last_live_check TIMESTAMP,
+        is_live BOOLEAN DEFAULT false,
+        viewer_count INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    // ライブデータ履歴テーブル
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS live_history (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(255) NOT NULL,
+        diamonds INTEGER DEFAULT 0,
+        gifts INTEGER DEFAULT 0,
+        comments INTEGER DEFAULT 0,
+        viewers INTEGER DEFAULT 0,
+        is_live BOOLEAN DEFAULT false,
+        recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    // インデックス作成
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+      CREATE INDEX IF NOT EXISTS idx_live_history_username ON live_history(username);
+      CREATE INDEX IF NOT EXISTS idx_live_history_recorded_at ON live_history(recorded_at);
+    `);
+    
+    console.log('データベース初期化完了');
+    
+    // 既存ユーザーの復元
+    await restoreExistingUsers();
+    
+  } catch (error) {
+    console.error('データベース初期化エラー:', error);
+  }
+}
+
+// 既存ユーザーの復元
+async function restoreExistingUsers() {
+  try {
+    console.log('既存ユーザーの復元開始...');
+    
+    const result = await pool.query(`
+      SELECT username, total_diamonds, total_gifts, total_comments, 
+             is_live, viewer_count, last_live_check
+      FROM users 
+      WHERE status = 'monitoring'
+      ORDER BY added_at ASC
+    `);
+    
+    console.log(`${result.rows.length}件のユーザーを復元中...`);
+    
+    for (const user of result.rows) {
+      // liveDataに復元
+      liveData.set(user.username, {
+        username: user.username,
+        isLive: user.is_live || false,
+        viewerCount: user.viewer_count || 0,
+        totalComments: user.total_comments || 0,
+        totalGifts: user.total_gifts || 0,
+        totalDiamonds: user.total_diamonds || 0,
+        lastUpdate: user.last_live_check || new Date().toISOString(),
+        recentComments: [],
+        recentGifts: []
+      });
+      
+      // TikTok接続を復元（エラーが発生してもスキップ）
+      try {
+        await connectToTikTokLive(user.username);
+        console.log(`${user.username}: 接続復元成功`);
+      } catch (error) {
+        console.log(`${user.username}: 接続復元失敗 - ${error.message}`);
+      }
+    }
+    
+    console.log('既存ユーザーの復元完了');
+    
+  } catch (error) {
+    console.error('ユーザー復元エラー:', error);
+  }
+}
 
 // Socket.io接続管理
 io.on('connection', (socket) => {
@@ -58,12 +163,60 @@ function createInitialUserData(username) {
   };
 }
 
+// データベースにユーザーデータ保存
+async function saveUserToDatabase(username, userData) {
+  try {
+    await pool.query(`
+      INSERT INTO users (username, total_diamonds, total_gifts, total_comments, 
+                        is_live, viewer_count, last_live_check)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT (username) 
+      DO UPDATE SET 
+        total_diamonds = $2,
+        total_gifts = $3,
+        total_comments = $4,
+        is_live = $5,
+        viewer_count = $6,
+        last_live_check = $7,
+        updated_at = CURRENT_TIMESTAMP
+    `, [
+      username,
+      userData.totalDiamonds || 0,
+      userData.totalGifts || 0,
+      userData.totalComments || 0,
+      userData.isLive || false,
+      userData.viewerCount || 0,
+      new Date()
+    ]);
+  } catch (error) {
+    console.error(`${username}: データベース保存エラー`, error);
+  }
+}
+
+// ライブ履歴データ保存
+async function saveLiveHistory(username, userData) {
+  try {
+    await pool.query(`
+      INSERT INTO live_history (username, diamonds, gifts, comments, viewers, is_live)
+      VALUES ($1, $2, $3, $4, $5, $6)
+    `, [
+      username,
+      userData.totalDiamonds || 0,
+      userData.totalGifts || 0,
+      userData.totalComments || 0,
+      userData.viewerCount || 0,
+      userData.isLive || false
+    ]);
+  } catch (error) {
+    console.error(`${username}: 履歴保存エラー`, error);
+  }
+}
+
 // 単一ユーザーのライブ状態チェック関数
 async function checkSingleUserLiveStatus(username) {
   try {
     console.log(`${username}: 即座ライブ状態チェック開始`);
     
-    // 新しい接続を試して確認
     const testConnection = new WebcastPushConnection(username, {
       enableExtendedGiftInfo: false,
     });
@@ -71,30 +224,30 @@ async function checkSingleUserLiveStatus(username) {
     await testConnection.connect();
     console.log(`${username}: ライブ配信中を確認（即座チェック）`);
     
-    // 接続成功した場合はライブ中なので何もしない
     testConnection.disconnect();
-    return true; // ライブ中
+    return true;
     
   } catch (error) {
     if (error.message.includes('LIVE has ended') || error.message.includes('UserOfflineError')) {
       console.log(`${username}: ライブ終了を検出（即座チェック）`);
       
-      // liveDataが存在する場合はオフライン設定
       const userData = liveData.get(username);
       if (userData) {
         userData.isLive = false;
         userData.lastUpdate = new Date().toISOString();
         liveData.set(username, userData);
         
-        // フロントエンドに通知
+        // データベースに保存
+        await saveUserToDatabase(username, userData);
+        
         io.emit('user-disconnected', { username });
         io.emit('live-data-update', { username, data: userData });
       }
       
-      return false; // オフライン
+      return false;
     } else {
       console.log(`${username}: 即座チェック中にエラー`, error.message);
-      return null; // 不明
+      return null;
     }
   }
 }
@@ -110,15 +263,15 @@ async function connectToTikTokLive(username) {
     tiktokLiveConnection.connect().then(async state => {
       console.log(`${username}: 接続成功`);
       
-      // 初期データ設定
       const initialData = createInitialUserData(username);
       liveData.set(username, initialData);
       
-      // データをクライアントに送信
+      // データベースに保存
+      await saveUserToDatabase(username, initialData);
+      
       io.emit('user-connected', { username, status: 'connected' });
       io.emit('live-data-update', { username, data: initialData });
       
-      // 接続成功後、5秒待ってから即座にライブ状態をチェック
       setTimeout(async () => {
         console.log(`${username}: 接続後の即座ライブ状態チェック開始`);
         await checkSingleUserLiveStatus(username);
@@ -126,24 +279,16 @@ async function connectToTikTokLive(username) {
       
     }).catch(err => {
       console.error(`${username}: 接続エラー`, err);
-      
-      // 接続失敗時はliveDataからも削除
       liveData.delete(username);
-      
-      // エラー情報をフロントエンドに送信
       io.emit('user-error', { username, error: err.message });
-      
-      // 接続失敗時は例外を投げる
       throw err;
     });
 
     // コメントイベント
-    tiktokLiveConnection.on('comment', data => {
+    tiktokLiveConnection.on('comment', async data => {
       try {
         let userData = liveData.get(username);
-        if (!userData) {
-          userData = createInitialUserData(username);
-        }
+        if (!userData) userData = createInitialUserData(username);
         
         userData.totalComments++;
         userData.recentComments.unshift({
@@ -152,13 +297,14 @@ async function connectToTikTokLive(username) {
           timestamp: new Date().toISOString()
         });
         
-        // 最新10件のコメントのみ保持
         userData.recentComments = userData.recentComments.slice(0, 10);
         userData.lastUpdate = new Date().toISOString();
         
         liveData.set(username, userData);
         
-        // リアルタイム送信
+        // データベースに保存
+        await saveUserToDatabase(username, userData);
+        
         io.emit('new-comment', { username, data: {
           user: data.nickname,
           comment: data.comment,
@@ -171,16 +317,13 @@ async function connectToTikTokLive(username) {
     });
 
     // ギフトイベント
-    tiktokLiveConnection.on('gift', data => {
+    tiktokLiveConnection.on('gift', async data => {
       try {
         let userData = liveData.get(username);
-        if (!userData) {
-          userData = createInitialUserData(username);
-        }
+        if (!userData) userData = createInitialUserData(username);
         
         userData.totalGifts++;
         
-        // ダイヤモンド計算（概算）
         const diamondValue = data.giftDetails?.diamond_count || data.repeatCount || 1;
         userData.totalDiamonds += diamondValue;
         
@@ -193,13 +336,14 @@ async function connectToTikTokLive(username) {
           timestamp: new Date().toISOString()
         });
         
-        // 最新10件のギフトのみ保持
         userData.recentGifts = userData.recentGifts.slice(0, 10);
         userData.lastUpdate = new Date().toISOString();
         
         liveData.set(username, userData);
         
-        // リアルタイム送信
+        // データベースに保存
+        await saveUserToDatabase(username, userData);
+        
         io.emit('new-gift', { username, data: userData.recentGifts[0] });
         io.emit('live-data-update', { username, data: userData });
       } catch (error) {
@@ -207,18 +351,20 @@ async function connectToTikTokLive(username) {
       }
     });
 
-    // 視聴者数更新（修正版）
-    tiktokLiveConnection.on('roomUser', data => {
+    // 視聴者数更新
+    tiktokLiveConnection.on('roomUser', async data => {
       try {
         let userData = liveData.get(username);
-        if (!userData) {
-          userData = createInitialUserData(username);
-        }
+        if (!userData) userData = createInitialUserData(username);
         
         userData.viewerCount = data.viewerCount || 0;
         userData.lastUpdate = new Date().toISOString();
         
         liveData.set(username, userData);
+        
+        // データベースに保存
+        await saveUserToDatabase(username, userData);
+        
         io.emit('live-data-update', { username, data: userData });
       } catch (error) {
         console.error(`${username}: 視聴者数更新エラー`, error);
@@ -238,7 +384,7 @@ async function connectToTikTokLive(username) {
     });
 
     // 切断イベント
-    tiktokLiveConnection.on('disconnected', () => {
+    tiktokLiveConnection.on('disconnected', async () => {
       console.log(`${username}: 切断`);
       try {
         const userData = liveData.get(username);
@@ -246,6 +392,9 @@ async function connectToTikTokLive(username) {
           userData.isLive = false;
           userData.lastUpdate = new Date().toISOString();
           liveData.set(username, userData);
+          
+          // データベースに保存
+          await saveUserToDatabase(username, userData);
         }
         io.emit('user-disconnected', { username });
       } catch (error) {
@@ -278,24 +427,19 @@ app.post('/api/add-user', async (req, res) => {
     return res.status(400).json({ error: 'ユーザー名が必要です' });
   }
   
-  // @を除去
   const cleanUsername = username.replace('@', '');
   
-  if (monitoredUsers.has(cleanUsername)) {
-    return res.status(400).json({ error: 'このユーザーは既に監視中です' });
-  }
-  
   try {
+    // データベースで重複チェック
+    const existingUser = await pool.query('SELECT username FROM users WHERE username = $1', [cleanUsername]);
+    if (existingUser.rows.length > 0) {
+      return res.status(400).json({ error: 'このユーザーは既に監視中です' });
+    }
+    
     await connectToTikTokLive(cleanUsername);
-    monitoredUsers.set(cleanUsername, {
-      username: cleanUsername,
-      addedAt: new Date().toISOString(),
-      status: 'monitoring'
-    });
     
     console.log(`${cleanUsername}: ユーザー追加完了、即座ライブ状態チェックを開始します`);
     
-    // ユーザー追加後、10秒待ってから即座にライブ状態をチェック
     setTimeout(async () => {
       console.log(`${cleanUsername}: ユーザー追加後の即座ライブ状態チェック`);
       await checkSingleUserLiveStatus(cleanUsername);
@@ -303,10 +447,8 @@ app.post('/api/add-user', async (req, res) => {
     
     res.json({ message: `${cleanUsername} の監視を開始しました` });
   } catch (error) {
-    // 接続エラーの場合、ユーザーデータも作成しない
     console.error(`${cleanUsername}: ユーザー追加失敗`, error);
     
-    // エラーの種類に応じたメッセージ
     let errorMessage = `接続エラー: ${error.message}`;
     if (error.message.includes('LIVE has ended')) {
       errorMessage = `${cleanUsername} は現在ライブ配信をしていません`;
@@ -319,30 +461,37 @@ app.post('/api/add-user', async (req, res) => {
 });
 
 // ユーザー削除
-app.post('/api/remove-user', (req, res) => {
+app.post('/api/remove-user', async (req, res) => {
   const { username } = req.body;
   const cleanUsername = username.replace('@', '');
   
-  if (!monitoredUsers.has(cleanUsername)) {
-    return res.status(404).json({ error: 'ユーザーが見つかりません' });
+  try {
+    // データベースから削除
+    const result = await pool.query('DELETE FROM users WHERE username = $1 RETURNING *', [cleanUsername]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'ユーザーが見つかりません' });
+    }
+    
+    // 接続を切断
+    const connection = connections.get(cleanUsername);
+    if (connection) {
+      connection.disconnect();
+      connections.delete(cleanUsername);
+    }
+    
+    liveData.delete(cleanUsername);
+    
+    io.emit('user-removed', { username: cleanUsername });
+    res.json({ message: `${cleanUsername} の監視を停止しました` });
+  } catch (error) {
+    console.error(`${cleanUsername}: 削除エラー`, error);
+    res.status(500).json({ error: '削除に失敗しました' });
   }
-  
-  // 接続を切断
-  const connection = connections.get(cleanUsername);
-  if (connection) {
-    connection.disconnect();
-    connections.delete(cleanUsername);
-  }
-  
-  monitoredUsers.delete(cleanUsername);
-  liveData.delete(cleanUsername);
-  
-  io.emit('user-removed', { username: cleanUsername });
-  res.json({ message: `${cleanUsername} の監視を停止しました` });
 });
 
 // CSV一括追加
-app.post('/api/upload-csv', upload.single('csvfile'), (req, res) => {
+app.post('/api/upload-csv', upload.single('csvfile'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'CSVファイルが必要です' });
   }
@@ -353,36 +502,28 @@ app.post('/api/upload-csv', upload.single('csvfile'), (req, res) => {
   fs.createReadStream(req.file.path)
     .pipe(csv())
     .on('data', (data) => {
-      // CSVの最初の列をユーザー名として扱う
       const username = Object.values(data)[0];
       if (username) {
         results.push(username.replace('@', ''));
       }
     })
     .on('end', async () => {
-      // アップロードファイルを削除
       fs.unlinkSync(req.file.path);
       
-      // 各ユーザーに接続を試行
       for (const username of results) {
-        if (!monitoredUsers.has(username)) {
-          try {
+        try {
+          // データベースで重複チェック
+          const existingUser = await pool.query('SELECT username FROM users WHERE username = $1', [username]);
+          if (existingUser.rows.length === 0) {
             await connectToTikTokLive(username);
-            monitoredUsers.set(username, {
-              username: username,
-              addedAt: new Date().toISOString(),
-              status: 'monitoring'
-            });
             
-            // CSV追加後も即座ライブ状態チェック（15秒待機）
             setTimeout(async () => {
               console.log(`${username}: CSV追加後の即座ライブ状態チェック`);
               await checkSingleUserLiveStatus(username);
             }, 15000);
-            
-          } catch (error) {
-            errors.push(`${username}: ${error.message}`);
           }
+        } catch (error) {
+          errors.push(`${username}: ${error.message}`);
         }
       }
       
@@ -394,38 +535,58 @@ app.post('/api/upload-csv', upload.single('csvfile'), (req, res) => {
 });
 
 // 監視ユーザー一覧取得
-app.get('/api/users', (req, res) => {
-  res.json({
-    users: Array.from(monitoredUsers.values()),
-    liveData: Object.fromEntries(liveData)
-  });
+app.get('/api/users', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT username, added_at, status, total_diamonds, total_gifts, 
+             total_comments, is_live, viewer_count, last_live_check
+      FROM users 
+      WHERE status = 'monitoring'
+      ORDER BY added_at ASC
+    `);
+    
+    const users = result.rows.map(row => ({
+      username: row.username,
+      addedAt: row.added_at,
+      status: row.status
+    }));
+    
+    res.json({
+      users: users,
+      liveData: Object.fromEntries(liveData)
+    });
+  } catch (error) {
+    console.error('ユーザー一覧取得エラー:', error);
+    res.status(500).json({ error: 'ユーザー一覧の取得に失敗しました' });
+  }
 });
 
 // ランキング取得
-app.get('/api/ranking', (req, res) => {
+app.get('/api/ranking', async (req, res) => {
   try {
-    // ライブデータから配列を作成
-    const users = Array.from(liveData.values());
+    const result = await pool.query(`
+      SELECT username, total_diamonds, total_gifts, total_comments, 
+             is_live, viewer_count, last_live_check
+      FROM users 
+      WHERE status = 'monitoring' AND total_diamonds > 0
+      ORDER BY total_diamonds DESC
+    `);
     
-    // ダイヤモンド数でソート（降順）
-    const dailyRanking = users
-      .filter(user => user.totalDiamonds > 0) // ダイヤモンドがあるユーザーのみ
-      .sort((a, b) => b.totalDiamonds - a.totalDiamonds)
-      .map((user, index) => ({
-        rank: index + 1,
-        username: user.username,
-        totalDiamonds: user.totalDiamonds,
-        totalGifts: user.totalGifts,
-        totalComments: user.totalComments,
-        viewerCount: user.viewerCount,
-        isLive: user.isLive,
-        estimatedEarnings: Math.round(user.totalDiamonds * 0.005 * 100) / 100, // $5/1000ダイヤモンド
-        lastUpdate: user.lastUpdate
-      }));
+    const dailyRanking = result.rows.map((user, index) => ({
+      rank: index + 1,
+      username: user.username,
+      totalDiamonds: user.total_diamonds,
+      totalGifts: user.total_gifts,
+      totalComments: user.total_comments,
+      viewerCount: user.viewer_count || 0,
+      isLive: user.is_live,
+      estimatedEarnings: Math.round(user.total_diamonds * 0.005 * 100) / 100,
+      lastUpdate: user.last_live_check
+    }));
     
     res.json({
       ranking: dailyRanking,
-      totalUsers: users.length,
+      totalUsers: await pool.query('SELECT COUNT(*) FROM users WHERE status = \'monitoring\'').then(r => parseInt(r.rows[0].count)),
       activeUsers: dailyRanking.length,
       lastUpdate: new Date().toISOString()
     });
@@ -443,26 +604,46 @@ app.get('/api/live-data', (req, res) => {
 // ルート設定
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'TikTok Live Monitor API',
+    status: 'TikTok Live Monitor API with PostgreSQL',
     timestamp: new Date().toISOString(),
-    version: '1.0.0'
+    version: '2.0.0'
   });
 });
 
 // ヘルスチェック
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
-    timestamp: new Date().toISOString(),
-    monitoredUsers: monitoredUsers.size,
-    activeConnections: connections.size
-  });
+app.get('/health', async (req, res) => {
+  try {
+    // データベース接続チェック
+    await pool.query('SELECT 1');
+    
+    const userCount = await pool.query('SELECT COUNT(*) FROM users WHERE status = \'monitoring\'');
+    
+    res.json({ 
+      status: 'OK', 
+      timestamp: new Date().toISOString(),
+      database: 'connected',
+      monitoredUsers: parseInt(userCount.rows[0].count),
+      activeConnections: connections.size
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'ERROR',
+      timestamp: new Date().toISOString(),
+      database: 'disconnected',
+      error: error.message
+    });
+  }
 });
 
 // 定期的なライブ状態チェック（3分ごと）
 setInterval(() => {
   checkLiveStatus();
 }, 3 * 60 * 1000);
+
+// 定期的な履歴保存（10分ごと）
+setInterval(() => {
+  saveBulkLiveHistory();
+}, 10 * 60 * 1000);
 
 // ライブ状態チェック関数
 async function checkLiveStatus() {
@@ -471,33 +652,30 @@ async function checkLiveStatus() {
   for (const [username, userData] of liveData) {
     if (userData.isLive) {
       try {
-        // 新しい接続を試して確認
         const testConnection = new WebcastPushConnection(username, {
           enableExtendedGiftInfo: false,
         });
         
         await testConnection.connect();
         console.log(`${username}: ライブ配信中を確認`);
-        
-        // 接続成功した場合はライブ中なので何もしない
         testConnection.disconnect();
         
       } catch (error) {
         if (error.message.includes('LIVE has ended') || error.message.includes('UserOfflineError')) {
           console.log(`${username}: ライブ終了を検出、オフライン設定`);
           
-          // オフライン設定
           userData.isLive = false;
           userData.lastUpdate = new Date().toISOString();
           liveData.set(username, userData);
           
-          // 既存の接続があれば切断
+          // データベースに保存
+          await saveUserToDatabase(username, userData);
+          
           const existingConnection = connections.get(username);
           if (existingConnection) {
             existingConnection.disconnect();
           }
           
-          // フロントエンドに通知
           io.emit('user-disconnected', { username });
           io.emit('live-data-update', { username, data: userData });
           
@@ -511,15 +689,36 @@ async function checkLiveStatus() {
   console.log('=== ライブ状態チェック完了 ===');
 }
 
+// 一括履歴保存
+async function saveBulkLiveHistory() {
+  console.log('=== 履歴データ保存開始 ===');
+  
+  for (const [username, userData] of liveData) {
+    try {
+      await saveLiveHistory(username, userData);
+    } catch (error) {
+      console.error(`${username}: 履歴保存エラー`, error);
+    }
+  }
+  
+  console.log('=== 履歴データ保存完了 ===');
+}
+
 // サーバー起動
 const PORT = process.env.PORT || 10000;
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`=== TikTok Live Monitor Server ===`);
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Timestamp: ${new Date().toISOString()}`);
-  console.log(`Health check: /health`);
-  console.log(`API Base: /api`);
+// データベース初期化後にサーバー起動
+initializeDatabase().then(() => {
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`=== TikTok Live Monitor Server with PostgreSQL ===`);
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Timestamp: ${new Date().toISOString()}`);
+    console.log(`Health check: /health`);
+    console.log(`API Base: /api`);
+  });
+}).catch(error => {
+  console.error('サーバー起動エラー:', error);
+  process.exit(1);
 });
 
 // エラーハンドリング
@@ -536,7 +735,7 @@ process.on('unhandledRejection', (err) => {
 });
 
 // 終了時の処理
-process.on('SIGTERM', () => {
+process.on('SIGTERM', async () => {
   console.log('サーバーを停止しています...');
   
   // 全ての接続を切断
@@ -544,6 +743,9 @@ process.on('SIGTERM', () => {
     console.log(`${username} の接続を切断中...`);
     connection.disconnect();
   });
+  
+  // データベース接続を閉じる
+  await pool.end();
   
   server.close(() => {
     console.log('サーバーが停止しました');
