@@ -276,7 +276,60 @@ async function saveLiveHistory(username, userData) {
   }
 }
 
-// 単一ユーザーのライブ状態チェック関数
+// より正確なライブ状態チェック関数
+async function checkSingleUserLiveStatusAccurate(username) {
+  try {
+    console.log(`${username}: 正確なライブ状態チェック開始`);
+    
+    const testConnection = new WebcastPushConnection(username, {
+      enableExtendedGiftInfo: false,
+      processInitialData: false,
+      enableWebsocketUpgrade: true,
+      requestPollingIntervalMs: 1000,
+      sessionId: undefined,
+      clientParams: {},
+      requestHeaders: {},
+      websocketHeaders: {},
+      requestOptions: {},
+      websocketOptions: {}
+    });
+    
+    // タイムアウト付きで接続テスト
+    const connectionPromise = testConnection.connect();
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('Connection timeout')), 10000);
+    });
+    
+    await Promise.race([connectionPromise, timeoutPromise]);
+    
+    // 短時間待機してライブストリームの状態を確認
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
+    console.log(`${username}: ライブ配信中を確認（高精度チェック）`);
+    testConnection.disconnect();
+    
+    return true;
+    
+  } catch (error) {
+    console.log(`${username}: ライブ状態チェックエラー - ${error.message}`);
+    
+    if (error.message.includes('LIVE has ended') || 
+        error.message.includes('UserOfflineError') ||
+        error.message.includes('User is not live') ||
+        error.message.includes('Room not found') ||
+        error.message.includes('Connection timeout')) {
+      
+      console.log(`${username}: オフライン状態を確認`);
+      return false;
+    }
+    
+    // 不明なエラーの場合はnullを返す
+    console.log(`${username}: 判定不能なエラー - ${error.message}`);
+    return null;
+  }
+}
+
+// 単一ユーザーのライブ状態チェック関数（既存）
 async function checkSingleUserLiveStatus(username) {
   try {
     console.log(`${username}: 即座ライブ状態チェック開始`);
@@ -483,7 +536,7 @@ async function connectToTikTokLive(username) {
 
 // API エンドポイント
 
-// ユーザー追加（接続数制限対応）
+// ユーザー追加（修正版）
 app.post('/api/add-user', async (req, res) => {
   const { username } = req.body;
   
@@ -491,9 +544,15 @@ app.post('/api/add-user', async (req, res) => {
     return res.status(400).json({ error: 'ユーザー名が必要です' });
   }
   
-  const cleanUsername = username.replace('@', '');
+  const cleanUsername = username.replace('@', '').trim();
+  
+  if (!cleanUsername) {
+    return res.status(400).json({ error: '有効なユーザー名を入力してください' });
+  }
   
   try {
+    console.log(`${cleanUsername}: ユーザー追加開始`);
+    
     // データベースで重複チェック
     const existingUser = await pool.query('SELECT username FROM users WHERE username = $1', [cleanUsername]);
     if (existingUser.rows.length > 0) {
@@ -502,44 +561,111 @@ app.post('/api/add-user', async (req, res) => {
     
     // 接続数制限チェック
     if (connections.size >= MAX_CONCURRENT_CONNECTIONS) {
-      // データベースには追加するが、接続は待機
+      console.log(`${cleanUsername}: 接続制限により待機キューに追加`);
+      
+      // データベースに待機状態で追加
       await pool.query(`
-        INSERT INTO users (username, status, is_live)
-        VALUES ($1, 'waiting', false)
+        INSERT INTO users (username, status, is_live, total_diamonds, total_gifts, total_comments, viewer_count)
+        VALUES ($1, 'waiting', false, 0, 0, 0, 0)
       `, [cleanUsername]);
+      
+      // liveDataに追加
+      const userData = {
+        username: cleanUsername,
+        isLive: false,
+        viewerCount: 0,
+        totalComments: 0,
+        totalGifts: 0,
+        totalDiamonds: 0,
+        lastUpdate: new Date().toISOString(),
+        recentComments: [],
+        recentGifts: []
+      };
+      liveData.set(cleanUsername, userData);
       
       connectionQueue.push(cleanUsername);
       
       return res.json({ 
         message: `${cleanUsername} を追加しました（接続待機中: ${connectionQueue.length}番目）`,
-        status: 'waiting'
+        status: 'waiting',
+        queuePosition: connectionQueue.length
       });
     }
     
-    await connectToTikTokLive(cleanUsername);
+    // TikTok接続を試行
+    console.log(`${cleanUsername}: TikTok接続試行中...`);
     
-    console.log(`${cleanUsername}: ユーザー追加完了、即座ライブ状態チェックを開始します`);
-    
-    setTimeout(async () => {
-      console.log(`${cleanUsername}: ユーザー追加後の即座ライブ状態チェック`);
-      await checkSingleUserLiveStatus(cleanUsername);
-    }, 10000);
-    
-    res.json({ 
-      message: `${cleanUsername} の監視を開始しました`,
-      status: 'active'
-    });
-  } catch (error) {
-    console.error(`${cleanUsername}: ユーザー追加失敗`, error);
-    
-    let errorMessage = `接続エラー: ${error.message}`;
-    if (error.message.includes('LIVE has ended')) {
-      errorMessage = `${cleanUsername} は現在ライブ配信をしていません`;
-    } else if (error.message.includes('UserOfflineError')) {
-      errorMessage = `${cleanUsername} はオフラインです`;
+    try {
+      await connectToTikTokLive(cleanUsername);
+      console.log(`${cleanUsername}: TikTok接続成功`);
+      
+      // 接続成功後、即座にライブ状態をチェック
+      setTimeout(async () => {
+        console.log(`${cleanUsername}: 追加後のライブ状態チェック`);
+        const isLive = await checkSingleUserLiveStatusAccurate(cleanUsername);
+        
+        if (isLive !== null) {
+          const userData = liveData.get(cleanUsername);
+          if (userData) {
+            userData.isLive = isLive;
+            userData.lastUpdate = new Date().toISOString();
+            liveData.set(cleanUsername, userData);
+            await saveUserToDatabase(cleanUsername, userData);
+            
+            io.emit('live-data-update', { username: cleanUsername, data: userData });
+            console.log(`${cleanUsername}: 初期ライブ状態設定完了 (${isLive ? 'ライブ中' : 'オフライン'})`);
+          }
+        }
+      }, 5000);
+      
+      res.json({ 
+        message: `${cleanUsername} の監視を開始しました`,
+        status: 'monitoring'
+      });
+      
+    } catch (connectError) {
+      console.error(`${cleanUsername}: TikTok接続失敗`, connectError);
+      
+      // 接続失敗でもデータベースには追加（待機状態）
+      await pool.query(`
+        INSERT INTO users (username, status, is_live, total_diamonds, total_gifts, total_comments, viewer_count)
+        VALUES ($1, 'waiting', false, 0, 0, 0, 0)
+      `, [cleanUsername]);
+      
+      // liveDataに追加
+      const userData = {
+        username: cleanUsername,
+        isLive: false,
+        viewerCount: 0,
+        totalComments: 0,
+        totalGifts: 0,
+        totalDiamonds: 0,
+        lastUpdate: new Date().toISOString(),
+        recentComments: [],
+        recentGifts: []
+      };
+      liveData.set(cleanUsername, userData);
+      
+      connectionQueue.push(cleanUsername);
+      
+      // エラーメッセージを分かりやすく
+      let errorMessage = connectError.message;
+      if (connectError.message.includes('LIVE has ended')) {
+        errorMessage = '現在ライブ配信をしていません（監視は開始されました）';
+      } else if (connectError.message.includes('UserOfflineError')) {
+        errorMessage = 'オフラインです（監視は開始されました）';
+      }
+      
+      res.json({
+        message: `${cleanUsername} を追加しました（接続エラー: ${errorMessage}）`,
+        status: 'waiting',
+        warning: errorMessage
+      });
     }
     
-    res.status(500).json({ error: errorMessage });
+  } catch (error) {
+    console.error(`${cleanUsername}: ユーザー追加エラー`, error);
+    res.status(500).json({ error: `追加エラー: ${error.message}` });
   }
 });
 
@@ -792,7 +918,25 @@ app.get('/api/connection-status', async (req, res) => {
   }
 });
 
-// 手動ライブ状態チェック
+// 高精度ライブ状態チェック（手動実行）
+app.post('/api/check-live-status-accurate', async (req, res) => {
+  try {
+    console.log('手動高精度ライブ状態チェック開始');
+    await checkLiveStatusAccurate();
+    
+    res.json({ 
+      message: '高精度ライブ状態チェックを実行しました',
+      timestamp: new Date().toISOString(),
+      liveDataSize: liveData.size,
+      connectionsSize: connections.size
+    });
+  } catch (error) {
+    console.error('手動高精度ライブ状態チェックエラー:', error);
+    res.status(500).json({ error: 'ライブ状態チェックに失敗しました' });
+  }
+});
+
+// 手動ライブ状態チェック（既存）
 app.post('/api/check-live-status', async (req, res) => {
   try {
     console.log('手動ライブ状態チェック開始');
@@ -915,17 +1059,109 @@ app.get('/health', async (req, res) => {
   }
 });
 
-// 定期的なライブ状態チェック（1分ごと）
+// 定期的なライブ状態チェック（高精度版、3分ごと）
 setInterval(() => {
-  checkLiveStatus();
-}, 1 * 60 * 1000); // 3分 → 1分に変更
+  checkLiveStatusAccurate();
+}, 3 * 60 * 1000); // 精度向上のため3分に戻す
 
 // 定期的な履歴保存（10分ごと）
 setInterval(() => {
   saveBulkLiveHistory();
 }, 10 * 60 * 1000);
 
-// 通知機能付きライブ状態チェック関数
+// 段階的ライブ状態チェック（精度向上版）
+async function checkLiveStatusAccurate() {
+  console.log('=== 高精度ライブ状態チェック開始 ===');
+  console.log(`liveData件数: ${liveData.size}`);
+  
+  if (liveData.size === 0) {
+    console.log('⚠️ liveDataが空です');
+    return;
+  }
+  
+  for (const [username, userData] of liveData) {
+    console.log(`${username}: 段階的チェック開始 (現在: ${userData.isLive ? 'ライブ中' : 'オフライン'})`);
+    
+    // 第1段階：簡易チェック
+    let isLive = await checkSingleUserLiveStatus(username);
+    
+    if (isLive === null) {
+      console.log(`${username}: 第1段階チェック失敗、第2段階へ`);
+      
+      // 第2段階：高精度チェック
+      isLive = await checkSingleUserLiveStatusAccurate(username);
+      
+      if (isLive === null) {
+        console.log(`${username}: 第2段階チェック失敗、現在の状態を維持`);
+        continue;
+      }
+    }
+    
+    const previousStatus = userData.isLive;
+    
+    // 状態変更の処理
+    if (isLive !== previousStatus) {
+      console.log(`${username}: 状態変更検出 ${previousStatus ? 'ライブ中' : 'オフライン'} → ${isLive ? 'ライブ中' : 'オフライン'}`);
+      
+      userData.isLive = isLive;
+      userData.lastUpdate = new Date().toISOString();
+      liveData.set(username, userData);
+      
+      // データベースに保存
+      await saveUserToDatabase(username, userData);
+      
+      // 通知送信
+      if (isLive) {
+        // ライブ開始
+        io.emit('user-connected', { username, status: 'connected' });
+        io.emit('live-status-change', { 
+          username, 
+          status: 'online',
+          timestamp: userData.lastUpdate,
+          message: `${username} がライブを開始しました`
+        });
+        
+        // TikTok接続を再開
+        if (!connections.has(username) && connections.size < MAX_CONCURRENT_CONNECTIONS) {
+          try {
+            await connectToTikTokLive(username);
+            console.log(`${username}: TikTok接続再開成功`);
+          } catch (error) {
+            console.error(`${username}: TikTok接続再開失敗`, error);
+          }
+        }
+      } else {
+        // ライブ終了
+        const existingConnection = connections.get(username);
+        if (existingConnection) {
+          existingConnection.disconnect();
+          connections.delete(username);
+        }
+        
+        io.emit('user-disconnected', { username });
+        io.emit('live-status-change', { 
+          username, 
+          status: 'offline',
+          timestamp: userData.lastUpdate,
+          message: `${username} がライブを終了しました`
+        });
+        
+        // 接続枠が空いたのでキューを処理
+        setTimeout(() => {
+          processConnectionQueue();
+        }, 1000);
+      }
+      
+      io.emit('live-data-update', { username, data: userData });
+    } else {
+      console.log(`${username}: 状態変更なし (${isLive ? 'ライブ中' : 'オフライン'})`);
+    }
+  }
+  
+  console.log('=== 高精度ライブ状態チェック完了 ===');
+}
+
+// 通知機能付きライブ状態チェック関数（既存を更新）
 async function checkLiveStatus() {
   console.log('=== ライブ状態チェック開始 ===');
   console.log(`liveData件数: ${liveData.size}`);
