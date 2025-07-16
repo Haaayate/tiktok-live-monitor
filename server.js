@@ -112,8 +112,10 @@ async function restoreExistingUsers() {
     console.log(`${result.rows.length}件のユーザーを復元中...`);
     
     for (const user of result.rows) {
-      // liveDataに復元
-      liveData.set(user.username, {
+      console.log(`${user.username}: 復元開始 (status: ${user.status})`);
+      
+      // liveDataに復元（必ず作成）
+      const userData = {
         username: user.username,
         isLive: user.is_live || false,
         viewerCount: user.viewer_count || 0,
@@ -123,15 +125,19 @@ async function restoreExistingUsers() {
         lastUpdate: user.last_live_check || new Date().toISOString(),
         recentComments: [],
         recentGifts: []
-      });
+      };
+      
+      liveData.set(user.username, userData);
+      console.log(`${user.username}: liveDataに復元完了`);
       
       // 接続数制限チェック
       if (user.status === 'monitoring' && connections.size < MAX_CONCURRENT_CONNECTIONS) {
         try {
           await connectToTikTokLive(user.username);
-          console.log(`${user.username}: 接続復元成功`);
+          console.log(`${user.username}: TikTok接続復元成功`);
         } catch (error) {
-          console.log(`${user.username}: 接続復元失敗 - ${error.message}`);
+          console.log(`${user.username}: TikTok接続復元失敗 - ${error.message}`);
+          // 接続失敗してもliveDataは保持
           // 接続失敗時は待機キューに追加
           connectionQueue.push(user.username);
           await pool.query('UPDATE users SET status = $1 WHERE username = $2', ['waiting', user.username]);
@@ -140,11 +146,14 @@ async function restoreExistingUsers() {
         // 接続制限により待機キューに追加
         connectionQueue.push(user.username);
         await pool.query('UPDATE users SET status = $1 WHERE username = $2', ['waiting', user.username]);
+        console.log(`${user.username}: 接続制限により待機キューに追加`);
       }
     }
     
     console.log('既存ユーザーの復元完了');
-    console.log(`アクティブ接続: ${connections.size}, 待機キュー: ${connectionQueue.length}`);
+    console.log(`liveData件数: ${liveData.size}`);
+    console.log(`アクティブ接続: ${connections.size}`);
+    console.log(`待機キュー: ${connectionQueue.length}`);
     
   } catch (error) {
     console.error('ユーザー復元エラー:', error);
@@ -698,6 +707,70 @@ app.post('/api/upload-csv', upload.single('csvfile'), async (req, res) => {
   }
 });
 
+// 緊急対応：liveData手動復元API
+app.post('/api/restore-live-data', async (req, res) => {
+  try {
+    console.log('手動liveData復元開始...');
+    
+    const result = await pool.query(`
+      SELECT username, total_diamonds, total_gifts, total_comments, 
+             is_live, viewer_count, last_live_check
+      FROM users 
+      WHERE status IN ('monitoring', 'waiting')
+    `);
+    
+    let restoredCount = 0;
+    
+    for (const user of result.rows) {
+      // 既存のliveDataがない場合のみ復元
+      if (!liveData.has(user.username)) {
+        const userData = {
+          username: user.username,
+          isLive: user.is_live || false,
+          viewerCount: user.viewer_count || 0,
+          totalComments: user.total_comments || 0,
+          totalGifts: user.total_gifts || 0,
+          totalDiamonds: user.total_diamonds || 0,
+          lastUpdate: user.last_live_check || new Date().toISOString(),
+          recentComments: [],
+          recentGifts: []
+        };
+        
+        liveData.set(user.username, userData);
+        restoredCount++;
+        
+        console.log(`${user.username}: liveDataを手動復元`);
+      }
+    }
+    
+    console.log(`手動liveData復元完了: ${restoredCount}件`);
+    
+    res.json({
+      success: true,
+      message: `${restoredCount}件のliveDataを復元しました`,
+      liveDataSize: liveData.size,
+      connectionsSize: connections.size
+    });
+    
+  } catch (error) {
+    console.error('手動liveData復元エラー:', error);
+    res.status(500).json({ error: '復元に失敗しました' });
+  }
+});
+
+// デバッグ用API
+app.get('/api/debug-status', (req, res) => {
+  res.json({
+    liveDataSize: liveData.size,
+    connectionsSize: connections.size,
+    connectionQueueLength: connectionQueue.length,
+    liveDataKeys: Array.from(liveData.keys()),
+    connectionKeys: Array.from(connections.keys()),
+    queueContents: connectionQueue,
+    sampleLiveData: liveData.size > 0 ? Object.fromEntries(Array.from(liveData.entries()).slice(0, 3)) : {}
+  });
+});
+
 // 接続状況確認API
 app.get('/api/connection-status', async (req, res) => {
   try {
@@ -855,9 +928,20 @@ setInterval(() => {
 // 通知機能付きライブ状態チェック関数
 async function checkLiveStatus() {
   console.log('=== ライブ状態チェック開始 ===');
+  console.log(`liveData件数: ${liveData.size}`);
+  console.log(`connections件数: ${connections.size}`);
+  
+  if (liveData.size === 0) {
+    console.log('⚠️ liveDataが空です - ユーザーが存在しません');
+    console.log('=== ライブ状態チェック完了 ===');
+    return;
+  }
+  
+  // デバッグ用: 現在のユーザーを表示
+  console.log('現在のユーザー:', Array.from(liveData.keys()));
   
   for (const [username, userData] of liveData) {
-    const previousLiveStatus = userData.isLive;
+    console.log(`${username}: 状態チェック開始 (現在: ${userData.isLive ? 'ライブ中' : 'オフライン'})`);
     
     if (userData.isLive) {
       try {
@@ -865,6 +949,7 @@ async function checkLiveStatus() {
           enableExtendedGiftInfo: false,
         });
         
+        console.log(`${username}: 接続テスト開始...`);
         await testConnection.connect();
         console.log(`${username}: ライブ配信中を確認`);
         testConnection.disconnect();
@@ -875,6 +960,8 @@ async function checkLiveStatus() {
         await saveUserToDatabase(username, userData);
         
       } catch (error) {
+        console.log(`${username}: 接続テストでエラー - ${error.message}`);
+        
         if (error.message.includes('LIVE has ended') || error.message.includes('UserOfflineError')) {
           console.log(`${username}: ライブ終了を検出、オフライン設定`);
           
@@ -902,16 +989,18 @@ async function checkLiveStatus() {
           });
           
         } else {
-          console.log(`${username}: チェック中にエラー`, error.message);
+          console.log(`${username}: 予期しないエラー`, error.message);
         }
       }
     } else {
+      console.log(`${username}: オフライン状態なので、ライブ開始チェックを実行`);
       // オフラインユーザーのライブ開始チェック
       try {
         const testConnection = new WebcastPushConnection(username, {
           enableExtendedGiftInfo: false,
         });
         
+        console.log(`${username}: オフライン→オンライン チェック開始...`);
         await testConnection.connect();
         console.log(`${username}: ライブ開始を検出！オンライン設定`);
         testConnection.disconnect();
@@ -943,9 +1032,10 @@ async function checkLiveStatus() {
         });
         
       } catch (error) {
+        console.log(`${username}: オフライン状態確認 - ${error.message}`);
         // まだオフラインのまま（正常）
         if (!error.message.includes('LIVE has ended') && !error.message.includes('UserOfflineError')) {
-          console.log(`${username}: オフラインチェック中にエラー`, error.message);
+          console.log(`${username}: オフラインチェック中に予期しないエラー`, error.message);
         }
       }
     }
