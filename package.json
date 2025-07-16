@@ -4,8 +4,7 @@
   "description": "TikTok Live監視システム",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "tiktok-live-connector": "^1.1.7",
@@ -13,10 +12,8 @@
     "socket.io": "^4.7.2",
     "cors": "^2.8.5",
     "multer": "^1.4.4",
-    "csv-parser": "^3.0.0"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.1"
+    "csv-parser": "^3.0.0",
+    "pg": "^8.8.0"
   },
   "engines": {
     "node": ">=16.0.0"
