@@ -7,9 +7,6 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "@tobyg74/tiktok-api-dl": "^1.0.9",
-    "tiktok-scraper": "^1.4.36",
-    "puppeteer": "^21.7.0",
     "express": "^4.19.2",
     "socket.io": "^4.8.0",
     "cors": "^2.8.5",
