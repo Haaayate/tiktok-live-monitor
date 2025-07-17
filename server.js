@@ -1,4 +1,4 @@
-// server.js - TikTokライブ監視バックエンド（PostgreSQL + CSV完全版）
+// server.js - TikTokライブ監視バックエンド（PostgreSQL + CSV + 代替ライブラリ完全版）
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -9,6 +9,8 @@ const csv = require('csv-parser');
 const fs = require('fs');
 const path = require('path');
 const { Pool } = require('pg');
+const axios = require('axios');
+const cheerio = require('cheerio');
 
 const app = express();
 const server = http.createServer(app);
@@ -276,6 +278,169 @@ async function saveLiveHistory(username, userData) {
   }
 }
 
+// =============================================================================
+// 代替ライブラリによるライブ検出システム
+// =============================================================================
+
+// Web Scrapingによるライブ検出
+async function checkLiveWithScraping(username) {
+    console.log(`🕷️ [${username}] Web Scraping でライブ状態チェック開始`);
+    
+    try {
+        const url = `https://www.tiktok.com/@${username}`;
+        
+        const response = await axios.get(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1'
+            },
+            timeout: 15000
+        });
+        
+        const $ = cheerio.load(response.data);
+        
+        // ライブ配信の指標を探す
+        const indicators = {
+            liveText: $('body').text().toLowerCase().includes('live'),
+            liveClass: $('.live').length > 0 || $('[class*="live"]').length > 0,
+            liveData: $('[data-live="true"]').length > 0,
+            roomId: /room_id['"]\s*:\s*['"]\d+['"]/.test(response.data)
+        };
+        
+        const isLive = Object.values(indicators).some(indicator => indicator);
+        
+        const result = {
+            isLive: isLive,
+            indicators: indicators,
+            source: 'web-scraping'
+        };
+        
+        console.log(`📊 [${username}] Web Scraping 結果:`, result);
+        return result;
+        
+    } catch (error) {
+        console.log(`❌ [${username}] Web Scraping エラー:`, error.message);
+        throw error;
+    }
+}
+
+// 直接APIによるライブ検出
+async function checkLiveWithDirectAPI(username) {
+    console.log(`🎯 [${username}] 直接API でライブ状態チェック開始`);
+    
+    try {
+        const apiUrl = `https://www.tiktok.com/api/user/detail/?uniqueId=${username}`;
+        
+        const response = await axios.get(apiUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': `https://www.tiktok.com/@${username}`,
+                'Accept': 'application/json',
+                'Accept-Language': 'en-US,en;q=0.9'
+            },
+            timeout: 10000
+        });
+        
+        if (response.data && response.data.userInfo) {
+            const userInfo = response.data.userInfo;
+            const user = userInfo.user;
+            
+            const isLive = userInfo.stats?.roomId || user.roomId || false;
+            
+            const result = {
+                isLive: !!isLive,
+                userInfo: {
+                    followerCount: userInfo.stats?.followerCount || 0,
+                    followingCount: userInfo.stats?.followingCount || 0,
+                    heartCount: userInfo.stats?.heartCount || 0,
+                    videoCount: userInfo.stats?.videoCount || 0,
+                    verified: user.verified || false,
+                    roomId: userInfo.stats?.roomId || user.roomId || null
+                },
+                source: 'direct-api'
+            };
+            
+            console.log(`📊 [${username}] 直接API 結果:`, result);
+            return result;
+        }
+        
+        throw new Error('APIレスポンスの形式が異常');
+        
+    } catch (error) {
+        console.log(`❌ [${username}] 直接API エラー:`, error.message);
+        throw error;
+    }
+}
+
+// 統合ライブ検出関数
+async function checkLiveWithAlternatives(username) {
+    console.log(`🔄 [${username}] 代替ライブラリによる統合チェック開始`);
+    
+    const results = {
+        username: username,
+        timestamp: new Date().toISOString(),
+        attempts: [],
+        finalResult: null
+    };
+    
+    // 方法1: 直接API（最も成功しやすい）
+    try {
+        const directResult = await checkLiveWithDirectAPI(username);
+        results.attempts.push({
+            method: 'direct-api',
+            result: 'success',
+            data: directResult
+        });
+        
+        if (directResult.isLive) {
+            results.finalResult = { isLive: true, source: 'direct-api', confidence: 'high' };
+            return results;
+        }
+    } catch (directError) {
+        results.attempts.push({
+            method: 'direct-api',
+            result: 'error',
+            error: { message: directError.message }
+        });
+    }
+    
+    // 方法2: Web Scraping
+    try {
+        await new Promise(resolve => setTimeout(resolve, 3000)); // 3秒待機
+        
+        const scrapingResult = await checkLiveWithScraping(username);
+        results.attempts.push({
+            method: 'web-scraping',
+            result: 'success',
+            data: scrapingResult
+        });
+        
+        if (scrapingResult.isLive) {
+            results.finalResult = { isLive: true, source: 'web-scraping', confidence: 'medium' };
+            return results;
+        }
+    } catch (scrapingError) {
+        results.attempts.push({
+            method: 'web-scraping',
+            result: 'error',
+            error: { message: scrapingError.message }
+        });
+    }
+    
+    // 全て失敗またはオフライン
+    results.finalResult = { isLive: false, source: 'all-methods', confidence: 'high' };
+    return results;
+}
+
+// =============================================================================
+// TikTok Live Connector（従来）によるライブ検出
+// =============================================================================
+
 // より正確なライブ状態チェック関数
 async function checkSingleUserLiveStatusAccurate(username) {
   try {
@@ -320,7 +485,7 @@ async function checkSingleUserLiveStatusAccurate(username) {
       'User is not live',
       'Room not found',
       'Connection timeout',
-      'Failed to retrieve the initial room data',  // 新しく追加
+      'Failed to retrieve the initial room data',
       'Failed to connect to websocket',
       'Unable to retrieve room data',
       'Room is not available',
@@ -549,187 +714,12 @@ async function connectToTikTokLive(username) {
   }
 }
 
+// =============================================================================
 // API エンドポイント
-
-
-// =============================================================================
-// TikTok接続デバッグ機能 - 追加開始
 // =============================================================================
 
-// より詳細なデバッグ付きTikTok接続テスト
-async function debugTikTokConnection(username) {
-    console.log(`🐛 [${username}] TikTok接続デバッグ開始`);
-    console.log(`📦 tiktok-live-connector バージョン: ${require('tiktok-live-connector/package.json').version}`);
-    
-    const results = {
-        username,
-        timestamp: new Date().toISOString(),
-        libraryVersion: require('tiktok-live-connector/package.json').version,
-        attempts: [],
-        systemInfo: {
-            nodeVersion: process.version,
-            platform: process.platform,
-            env: process.env.NODE_ENV
-        }
-    };
-    
-    // 試行1: 最小設定での接続
-    try {
-        console.log(`🔍 [${username}] 最小設定テスト...`);
-        
-        const connection = new WebcastPushConnection(username, {
-            enableExtendedGiftInfo: false,
-            processInitialData: false,
-            enableWebsocketUpgrade: false,
-            requestPollingIntervalMs: 2000,
-            requestOptions: {
-                timeout: 10000
-            }
-        });
-        
-        // 詳細なイベントリスナーを追加
-        connection.on('connect', (state) => {
-            console.log(`✅ [${username}] 接続イベント発生:`, state);
-        });
-        
-        connection.on('error', (error) => {
-            console.log(`❌ [${username}] エラーイベント:`, error);
-        });
-        
-        connection.on('disconnect', () => {
-            console.log(`🔌 [${username}] 切断イベント`);
-        });
-        
-        // タイムアウト付きで接続
-        const connectPromise = connection.connect();
-        const timeoutPromise = new Promise((_, reject) => {
-            setTimeout(() => reject(new Error('接続タイムアウト (10秒)')), 10000);
-        });
-        
-        const connectResult = await Promise.race([connectPromise, timeoutPromise]);
-        
-        console.log(`✅ [${username}] 最小設定接続成功:`, connectResult);
-        
-        results.attempts.push({
-            method: 'minimal_config',
-            result: 'success',
-            connectResult: connectResult,
-            message: 'ライブ配信中（最小設定）'
-        });
-        
-        // 少し待ってから切断
-        setTimeout(() => {
-            connection.disconnect();
-        }, 2000);
-        
-        return { isLive: true, details: results };
-        
-    } catch (error) {
-        console.log(`❌ [${username}] 最小設定エラー:`, error);
-        console.log(`📊 [${username}] エラー詳細:`, {
-            name: error.name,
-            message: error.message,
-            stack: error.stack,
-            code: error.code
-        });
-        
-        results.attempts.push({
-            method: 'minimal_config',
-            result: 'error',
-            error: {
-                name: error.name,
-                message: error.message,
-                code: error.code
-            }
-        });
-    }
-    
-    // 試行2: 異なるユーザーエージェント設定
-    try {
-        console.log(`🔍 [${username}] カスタムヘッダーテスト...`);
-        
-        const connection = new WebcastPushConnection(username, {
-            enableExtendedGiftInfo: false,
-            requestHeaders: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            },
-            requestOptions: {
-                timeout: 15000
-            }
-        });
-        
-        await connection.connect();
-        console.log(`✅ [${username}] カスタムヘッダー接続成功`);
-        
-        results.attempts.push({
-            method: 'custom_headers',
-            result: 'success',
-            message: 'ライブ配信中（カスタムヘッダー）'
-        });
-        
-        setTimeout(() => {
-            connection.disconnect();
-        }, 2000);
-        
-        return { isLive: true, details: results };
-        
-    } catch (error) {
-        console.log(`❌ [${username}] カスタムヘッダーエラー:`, error.message);
-        
-        results.attempts.push({
-            method: 'custom_headers',
-            result: 'error',
-            error: {
-                message: error.message,
-                code: error.code
-            }
-        });
-    }
-    
-    // 試行3: WebSocket無効化テスト
-    try {
-        console.log(`🔍 [${username}] WebSocket無効化テスト...`);
-        
-        const connection = new WebcastPushConnection(username, {
-            enableExtendedGiftInfo: false,
-            enableWebsocketUpgrade: false,
-            processInitialData: true,
-            requestPollingIntervalMs: 1000
-        });
-        
-        await connection.connect();
-        console.log(`✅ [${username}] WebSocket無効化接続成功`);
-        
-        results.attempts.push({
-            method: 'no_websocket',
-            result: 'success',
-            message: 'ライブ配信中（WebSocket無効）'
-        });
-        
-        setTimeout(() => {
-            connection.disconnect();
-        }, 2000);
-        
-        return { isLive: true, details: results };
-        
-    } catch (error) {
-        console.log(`❌ [${username}] WebSocket無効化エラー:`, error.message);
-        
-        results.attempts.push({
-            method: 'no_websocket',
-            result: 'error',
-            error: {
-                message: error.message
-            }
-        });
-    }
-    
-    console.log(`⚫ [${username}] 全ての接続方法が失敗`);
-    return { isLive: false, details: results };
-}
-
-// デバッグテスト用APIエンドポイント
-app.post('/api/debug-tiktok-connection', async (req, res) => {
+// 代替ライブラリテストAPI
+app.post('/api/test-alternative-libs', async (req, res) => {
     const { username } = req.body;
     
     if (!username) {
@@ -737,27 +727,51 @@ app.post('/api/debug-tiktok-connection', async (req, res) => {
     }
     
     const cleanUsername = username.replace('@', '').trim();
-    console.log(`🐛 TikTok接続デバッグ開始: ${cleanUsername}`);
+    console.log(`🔄 代替ライブラリテスト開始: ${cleanUsername}`);
     
     try {
-        const result = await debugTikTokConnection(cleanUsername);
+        const results = await checkLiveWithAlternatives(cleanUsername);
         
-        console.log(`📊 デバッグ結果 [${cleanUsername}]:`, JSON.stringify(result, null, 2));
+        console.log(`📊 代替ライブラリテスト結果 [${cleanUsername}]:`, JSON.stringify(results, null, 2));
         
         res.json({
             success: true,
             username: cleanUsername,
-            result: result,
+            results: results,
             timestamp: new Date().toISOString()
         });
         
     } catch (error) {
-        console.error(`❌ デバッグエラー [${cleanUsername}]:`, error);
+        console.error(`❌ 代替ライブラリテストエラー [${cleanUsername}]:`, error);
         res.status(500).json({ 
-            error: `デバッグエラー: ${error.message}`,
+            error: `代替ライブラリテストエラー: ${error.message}`,
             username: cleanUsername
         });
     }
+});
+
+// 代替ライブラリ情報API
+app.get('/api/alternative-lib-info', (req, res) => {
+    res.json({
+        success: true,
+        libraries: [
+            {
+                name: 'axios',
+                version: 'latest',
+                status: 'available'
+            },
+            {
+                name: 'cheerio',
+                version: 'latest',
+                status: 'available'
+            }
+        ],
+        methods: [
+            'direct-api',
+            'web-scraping'
+        ],
+        timestamp: new Date().toISOString()
+    });
 });
 
 // ライブラリ情報確認用エンドポイント
@@ -789,77 +803,6 @@ app.get('/api/library-info', (req, res) => {
         });
     }
 });
-
-// =============================================================================
-// TikTok接続デバッグ機能 - 追加終了
-// =============================================================================
-
-
-// デバッグテスト用APIエンドポイント
-app.post('/api/debug-tiktok-connection', async (req, res) => {
-    const { username } = req.body;
-    
-    if (!username) {
-        return res.status(400).json({ error: 'ユーザー名が必要です' });
-    }
-    
-    const cleanUsername = username.replace('@', '').trim();
-    console.log(`🐛 TikTok接続デバッグ開始: ${cleanUsername}`);
-    
-    try {
-        const result = await debugTikTokConnection(cleanUsername);
-        
-        console.log(`📊 デバッグ結果 [${cleanUsername}]:`, JSON.stringify(result, null, 2));
-        
-        res.json({
-            success: true,
-            username: cleanUsername,
-            result: result,
-            timestamp: new Date().toISOString()
-        });
-        
-    } catch (error) {
-        console.error(`❌ デバッグエラー [${cleanUsername}]:`, error);
-        res.status(500).json({ 
-            error: `デバッグエラー: ${error.message}`,
-            username: cleanUsername
-        });
-    }
-});
-
-// ライブラリ情報確認用エンドポイント
-app.get('/api/library-info', (req, res) => {
-    try {
-        const packageInfo = require('tiktok-live-connector/package.json');
-        
-        res.json({
-            success: true,
-            library: {
-                name: packageInfo.name,
-                version: packageInfo.version,
-                description: packageInfo.description,
-                lastModified: packageInfo._time || 'unknown'
-            },
-            system: {
-                nodeVersion: process.version,
-                platform: process.platform,
-                architecture: process.arch,
-                environment: process.env.NODE_ENV || 'development'
-            },
-            timestamp: new Date().toISOString()
-        });
-        
-    } catch (error) {
-        res.status(500).json({
-            error: 'ライブラリ情報の取得に失敗しました',
-            details: error.message
-        });
-    }
-});
-
-// =============================================================================
-// TikTok接続デバッグ機能 - 追加終了
-// =============================================================================
 
 // ユーザー追加（完全修正版）
 app.post('/api/add-user', async (req, res) => {
@@ -919,13 +862,13 @@ app.post('/api/add-user', async (req, res) => {
     
     await pool.query(insertQuery, [
       cleanUsername,
-      'monitoring',  // 初期状態は monitoring
-      false,         // 初期状態はオフライン
-      0,            // total_diamonds
-      0,            // total_gifts
-      0,            // total_comments
-      0,            // viewer_count
-      currentTime   // last_live_check
+      'monitoring',
+      false,
+      0,
+      0,
+      0,
+      0,
+      currentTime
     ]);
     
     console.log(`${cleanUsername}: データベースに追加完了`);
@@ -949,67 +892,92 @@ app.post('/api/add-user', async (req, res) => {
       });
     }
     
-    // TikTok接続を試行
-    console.log(`${cleanUsername}: TikTok接続試行開始`);
+    // まず代替ライブラリでライブ状態をチェック
+    console.log(`${cleanUsername}: 代替ライブラリでライブ状態チェック開始`);
     
     try {
-      await connectToTikTokLive(cleanUsername);
-      console.log(`${cleanUsername}: TikTok接続成功`);
+      const alternativeResult = await checkLiveWithAlternatives(cleanUsername);
       
-      // 接続成功の通知
-      io.emit('user-connected', { username: cleanUsername, status: 'connected' });
-      io.emit('live-data-update', { username: cleanUsername, data: userData });
-      
-      // 5秒後にライブ状態をチェック
-      setTimeout(async () => {
-        console.log(`${cleanUsername}: 追加後ライブ状態チェック開始`);
+      if (alternativeResult.finalResult && alternativeResult.finalResult.isLive) {
+        console.log(`${cleanUsername}: 代替ライブラリでライブ検出成功`);
+        userData.isLive = true;
+        liveData.set(cleanUsername, userData);
+        await saveUserToDatabase(cleanUsername, userData);
+        
+        // TikTok Live Connector での接続も試行
         try {
-          const isLive = await checkSingleUserLiveStatusAccurate(cleanUsername);
-          
-          if (isLive !== null) {
-            const currentUserData = liveData.get(cleanUsername);
-            if (currentUserData) {
-              currentUserData.isLive = isLive;
-              currentUserData.lastUpdate = new Date().toISOString();
-              liveData.set(cleanUsername, currentUserData);
-              await saveUserToDatabase(cleanUsername, currentUserData);
-              
-              // 状態変更を通知
-              io.emit('live-data-update', { username: cleanUsername, data: currentUserData });
-              console.log(`${cleanUsername}: 初期ライブ状態設定完了 (${isLive ? 'ライブ中' : 'オフライン'})`);
-            }
-          }
-        } catch (statusError) {
-          console.error(`${cleanUsername}: 状態チェックエラー`, statusError);
+          await connectToTikTokLive(cleanUsername);
+          console.log(`${cleanUsername}: TikTok Live Connector接続も成功`);
+        } catch (connectorError) {
+          console.log(`${cleanUsername}: TikTok Live Connector失敗だが、代替ライブラリで検出済み`);
         }
-      }, 5000);
-      
-      res.json({ 
-        message: `${cleanUsername} の監視を開始しました`,
-        status: 'monitoring'
-      });
-      
-    } catch (connectError) {
-      console.log(`${cleanUsername}: TikTok接続失敗 - ${connectError.message}`);
-      
-      // 接続失敗でもユーザーは追加済み（監視状態のまま）
-      // エラーメッセージを分かりやすく
-      let errorMessage = connectError.message;
-      if (connectError.message.includes('LIVE has ended') || 
-          connectError.message.includes('Failed to retrieve the initial room data')) {
-        errorMessage = '現在ライブ配信をしていません';
-      } else if (connectError.message.includes('UserOfflineError')) {
-        errorMessage = 'オフラインです';
+        
+        io.emit('user-connected', { username: cleanUsername, status: 'connected' });
+        io.emit('live-data-update', { username: cleanUsername, data: userData });
+        
+        return res.json({ 
+          message: `${cleanUsername} の監視を開始しました（ライブ配信中）`,
+          status: 'monitoring',
+          source: alternativeResult.finalResult.source
+        });
+        
+      } else {
+        console.log(`${cleanUsername}: 代替ライブラリでオフライン検出`);
+        
+        // TikTok Live Connector でも試行
+        try {
+          await connectToTikTokLive(cleanUsername);
+          console.log(`${cleanUsername}: TikTok Live Connector接続成功`);
+          
+          io.emit('user-connected', { username: cleanUsername, status: 'connected' });
+          io.emit('live-data-update', { username: cleanUsername, data: userData });
+          
+          return res.json({ 
+            message: `${cleanUsername} の監視を開始しました`,
+            status: 'monitoring'
+          });
+          
+        } catch (connectError) {
+          console.log(`${cleanUsername}: 全ての接続方法が失敗`);
+          
+          // 接続失敗でもユーザーは追加済み
+          io.emit('live-data-update', { username: cleanUsername, data: userData });
+          
+          return res.json({
+            message: `${cleanUsername} を追加しました（現在ライブ配信していません）`,
+            status: 'monitoring',
+            warning: '現在ライブ配信していません'
+          });
+        }
       }
       
-      // クライアントに通知
-      io.emit('live-data-update', { username: cleanUsername, data: userData });
+    } catch (alternativeError) {
+      console.log(`${cleanUsername}: 代替ライブラリエラー、従来方法を試行`);
       
-      res.json({
-        message: `${cleanUsername} を追加しました（${errorMessage}）`,
-        status: 'monitoring',
-        warning: errorMessage
-      });
+      // 代替ライブラリが失敗した場合は従来の方法
+      try {
+        await connectToTikTokLive(cleanUsername);
+        console.log(`${cleanUsername}: 従来のTikTok接続成功`);
+        
+        io.emit('user-connected', { username: cleanUsername, status: 'connected' });
+        io.emit('live-data-update', { username: cleanUsername, data: userData });
+        
+        return res.json({ 
+          message: `${cleanUsername} の監視を開始しました`,
+          status: 'monitoring'
+        });
+        
+      } catch (connectError) {
+        console.log(`${cleanUsername}: 全ての接続方法が失敗`);
+        
+        io.emit('live-data-update', { username: cleanUsername, data: userData });
+        
+        return res.json({
+          message: `${cleanUsername} を追加しました（接続に問題があります）`,
+          status: 'monitoring',
+          warning: '接続に問題があります'
+        });
+      }
     }
     
   } catch (error) {
@@ -1080,13 +1048,11 @@ app.post('/api/upload-csv', upload.single('csvfile'), async (req, res) => {
   const waitingUsers = [];
   
   try {
-    // CSVファイルを読み込み
     const csvData = await new Promise((resolve, reject) => {
       const data = [];
       fs.createReadStream(req.file.path)
         .pipe(csv())
         .on('data', (row) => {
-          // CSVの最初の列をユーザー名として扱う
           const username = Object.values(row)[0];
           if (username && username.trim()) {
             data.push(username.replace('@', '').trim());
@@ -1096,15 +1062,12 @@ app.post('/api/upload-csv', upload.single('csvfile'), async (req, res) => {
         .on('error', reject);
     });
     
-    // アップロードファイルを削除
     fs.unlinkSync(req.file.path);
     
     console.log(`CSV一括登録: ${csvData.length}件のユーザーを処理開始`);
     
-    // 各ユーザーに対して処理
     for (const username of csvData) {
       try {
-        // データベースで重複チェック
         const existingUser = await pool.query(
           'SELECT username FROM users WHERE username = $1', 
           [username]
@@ -1115,9 +1078,7 @@ app.post('/api/upload-csv', upload.single('csvfile'), async (req, res) => {
           continue;
         }
         
-        // 接続数制限チェック
         if (connections.size >= MAX_CONCURRENT_CONNECTIONS) {
-          // データベースには追加するが、接続は待機
           await pool.query(`
             INSERT INTO users (username, status, is_live)
             VALUES ($1, 'waiting', false)
@@ -1128,41 +1089,22 @@ app.post('/api/upload-csv', upload.single('csvfile'), async (req, res) => {
           
           console.log(`${username}: CSV経由で追加（待機キュー）`);
         } else {
-          // TikTok接続を試行
           await connectToTikTokLive(username);
           successUsers.push(username);
           
           console.log(`${username}: CSV経由で追加成功`);
-          
-          // 即座ライブ状態チェック（非同期で実行）
-          setTimeout(async () => {
-            console.log(`${username}: CSV追加後の即座ライブ状態チェック`);
-            await checkSingleUserLiveStatus(username);
-          }, 15000 + (successUsers.length * 1000)); // 時間差を設けて負荷分散
         }
         
       } catch (error) {
         console.error(`${username}: CSV追加エラー - ${error.message}`);
-        
-        // エラーメッセージを分かりやすく
-        let errorMessage = error.message;
-        if (error.message.includes('LIVE has ended')) {
-          errorMessage = '現在ライブ配信していません';
-        } else if (error.message.includes('UserOfflineError')) {
-          errorMessage = 'オフラインです';
-        }
-        
-        errors.push(`${username}: ${errorMessage}`);
+        errors.push(`${username}: ${error.message}`);
       }
     }
     
-    // 結果を返す
     let responseMessage = `${successUsers.length}件のユーザーを追加しました`;
     if (waitingUsers.length > 0) {
       responseMessage += `（${waitingUsers.length}件は接続待機中）`;
     }
-    
-    console.log(`CSV一括登録完了: ${responseMessage}`);
     
     res.json({ 
       message: responseMessage,
@@ -1175,7 +1117,6 @@ app.post('/api/upload-csv', upload.single('csvfile'), async (req, res) => {
   } catch (error) {
     console.error('CSV処理エラー:', error);
     
-    // ファイルが残っている場合は削除
     if (fs.existsSync(req.file.path)) {
       fs.unlinkSync(req.file.path);
     }
@@ -1220,216 +1161,6 @@ app.post('/api/check-user-detailed', async (req, res) => {
   } catch (error) {
     console.error(`${cleanUsername}: 詳細チェックエラー`, error);
     res.status(500).json({ error: `チェックエラー: ${error.message}` });
-  }
-});
-
-// 緊急対応：liveData手動復元API
-app.post('/api/restore-live-data', async (req, res) => {
-  try {
-    console.log('手動liveData復元開始...');
-    
-    const result = await pool.query(`
-      SELECT username, total_diamonds, total_gifts, total_comments, 
-             is_live, viewer_count, last_live_check
-      FROM users 
-      WHERE status IN ('monitoring', 'waiting')
-    `);
-    
-    let restoredCount = 0;
-    
-    for (const user of result.rows) {
-      // 既存のliveDataがない場合のみ復元
-      if (!liveData.has(user.username)) {
-        const userData = {
-          username: user.username,
-          isLive: user.is_live || false,
-          viewerCount: user.viewer_count || 0,
-          totalComments: user.total_comments || 0,
-          totalGifts: user.total_gifts || 0,
-          totalDiamonds: user.total_diamonds || 0,
-          lastUpdate: user.last_live_check || new Date().toISOString(),
-          recentComments: [],
-          recentGifts: []
-        };
-        
-        liveData.set(user.username, userData);
-        restoredCount++;
-        
-        console.log(`${user.username}: liveDataを手動復元`);
-      }
-    }
-    
-    console.log(`手動liveData復元完了: ${restoredCount}件`);
-    
-    res.json({
-      success: true,
-      message: `${restoredCount}件のliveDataを復元しました`,
-      liveDataSize: liveData.size,
-      connectionsSize: connections.size
-    });
-    
-  } catch (error) {
-    console.error('手動liveData復元エラー:', error);
-    res.status(500).json({ error: '復元に失敗しました' });
-  }
-});
-
-// デバッグ用：ユーザー追加ログAPI
-app.post('/api/debug-add-user', async (req, res) => {
-  const { username } = req.body;
-  
-  console.log('=== デバッグ：ユーザー追加開始 ===');
-  console.log('リクエストボディ:', req.body);
-  console.log('受信ユーザー名:', username);
-  
-  if (!username) {
-    console.log('エラー: ユーザー名が空');
-    return res.status(400).json({ 
-      error: 'ユーザー名が必要です',
-      debug: { receivedBody: req.body }
-    });
-  }
-  
-  const cleanUsername = username.replace('@', '').trim();
-  console.log('クリーンアップ後:', cleanUsername);
-  
-  try {
-    // 現在の状態確認
-    const currentState = {
-      liveDataSize: liveData.size,
-      connectionsSize: connections.size,
-      queueLength: connectionQueue.length,
-      maxConnections: MAX_CONCURRENT_CONNECTIONS
-    };
-    
-    console.log('現在の状態:', currentState);
-    
-    // データベース状態確認
-    const existingUser = await pool.query('SELECT username, status FROM users WHERE username = $1', [cleanUsername]);
-    console.log('データベース確認結果:', existingUser.rows);
-    
-    // liveData確認
-    const existingLiveData = liveData.get(cleanUsername);
-    console.log('既存liveData:', existingLiveData);
-    
-    if (existingUser.rows.length > 0) {
-      return res.status(400).json({ 
-        error: 'このユーザーは既に監視中です',
-        debug: {
-          existingUser: existingUser.rows[0],
-          existingLiveData: existingLiveData,
-          currentState: currentState
-        }
-      });
-    }
-    
-    // 実際の追加テスト（データベースのみ）
-    const insertQuery = `
-      INSERT INTO users (username, status, is_live, total_diamonds, total_gifts, total_comments, viewer_count, last_live_check)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      RETURNING *
-    `;
-    
-    const insertResult = await pool.query(insertQuery, [
-      cleanUsername,
-      'monitoring',
-      false,
-      0,
-      0,
-      0,
-      0,
-      new Date()
-    ]);
-    
-    console.log('データベース挿入結果:', insertResult.rows[0]);
-    
-    res.json({
-      success: true,
-      message: 'デバッグ追加テスト成功',
-      debug: {
-        cleanUsername: cleanUsername,
-        insertedUser: insertResult.rows[0],
-        currentState: currentState
-      }
-    });
-    
-  } catch (error) {
-    console.error('デバッグ追加エラー:', error);
-    res.status(500).json({ 
-      error: error.message,
-      debug: {
-        cleanUsername: cleanUsername,
-        errorStack: error.stack
-      }
-    });
-  }
-});
-
-// デバッグ用API
-app.get('/api/debug-status', (req, res) => {
-  res.json({
-    liveDataSize: liveData.size,
-    connectionsSize: connections.size,
-    connectionQueueLength: connectionQueue.length,
-    liveDataKeys: Array.from(liveData.keys()),
-    connectionKeys: Array.from(connections.keys()),
-    queueContents: connectionQueue,
-    sampleLiveData: liveData.size > 0 ? Object.fromEntries(Array.from(liveData.entries()).slice(0, 3)) : {}
-  });
-});
-
-// 接続状況確認API
-app.get('/api/connection-status', async (req, res) => {
-  try {
-    const totalUsers = await pool.query('SELECT COUNT(*) FROM users');
-    const activeUsers = await pool.query('SELECT COUNT(*) FROM users WHERE status = \'monitoring\'');
-    const waitingUsers = await pool.query('SELECT COUNT(*) FROM users WHERE status = \'waiting\'');
-    
-    res.json({
-      totalUsers: parseInt(totalUsers.rows[0].count),
-      activeUsers: parseInt(activeUsers.rows[0].count),
-      waitingUsers: parseInt(waitingUsers.rows[0].count),
-      activeConnections: connections.size,
-      queueLength: connectionQueue.length,
-      maxConnections: MAX_CONCURRENT_CONNECTIONS,
-      availableSlots: MAX_CONCURRENT_CONNECTIONS - connections.size
-    });
-  } catch (error) {
-    res.status(500).json({ error: '接続状況の取得に失敗しました' });
-  }
-});
-
-// 高精度ライブ状態チェック（手動実行）
-app.post('/api/check-live-status-accurate', async (req, res) => {
-  try {
-    console.log('手動高精度ライブ状態チェック開始');
-    await checkLiveStatusAccurate();
-    
-    res.json({ 
-      message: '高精度ライブ状態チェックを実行しました',
-      timestamp: new Date().toISOString(),
-      liveDataSize: liveData.size,
-      connectionsSize: connections.size
-    });
-  } catch (error) {
-    console.error('手動高精度ライブ状態チェックエラー:', error);
-    res.status(500).json({ error: 'ライブ状態チェックに失敗しました' });
-  }
-});
-
-// 手動ライブ状態チェック（既存）
-app.post('/api/check-live-status', async (req, res) => {
-  try {
-    console.log('手動ライブ状態チェック開始');
-    await checkLiveStatus();
-    
-    res.json({ 
-      message: 'ライブ状態チェックを実行しました',
-      timestamp: new Date().toISOString()
-    });
-  } catch (error) {
-    console.error('手動ライブ状態チェックエラー:', error);
-    res.status(500).json({ error: 'ライブ状態チェックに失敗しました' });
   }
 });
 
@@ -1495,6 +1226,27 @@ app.get('/api/ranking', async (req, res) => {
   }
 });
 
+// 接続状況確認API
+app.get('/api/connection-status', async (req, res) => {
+  try {
+    const totalUsers = await pool.query('SELECT COUNT(*) FROM users');
+    const activeUsers = await pool.query('SELECT COUNT(*) FROM users WHERE status = \'monitoring\'');
+    const waitingUsers = await pool.query('SELECT COUNT(*) FROM users WHERE status = \'waiting\'');
+    
+    res.json({
+      totalUsers: parseInt(totalUsers.rows[0].count),
+      activeUsers: parseInt(activeUsers.rows[0].count),
+      waitingUsers: parseInt(waitingUsers.rows[0].count),
+      activeConnections: connections.size,
+      queueLength: connectionQueue.length,
+      maxConnections: MAX_CONCURRENT_CONNECTIONS,
+      availableSlots: MAX_CONCURRENT_CONNECTIONS - connections.size
+    });
+  } catch (error) {
+    res.status(500).json({ error: '接続状況の取得に失敗しました' });
+  }
+});
+
 // ライブデータ取得
 app.get('/api/live-data', (req, res) => {
   res.json(Object.fromEntries(liveData));
@@ -1503,16 +1255,15 @@ app.get('/api/live-data', (req, res) => {
 // ルート設定
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'TikTok Live Monitor API with PostgreSQL + CSV + Connection Management',
+    status: 'TikTok Live Monitor API with Alternative Libraries',
     timestamp: new Date().toISOString(),
-    version: '2.2.0'
+    version: '3.0.0'
   });
 });
 
 // ヘルスチェック
 app.get('/health', async (req, res) => {
   try {
-    // データベース接続チェック
     await pool.query('SELECT 1');
     
     const userCount = await pool.query('SELECT COUNT(*) FROM users WHERE status = \'monitoring\'');
@@ -1528,7 +1279,7 @@ app.get('/health', async (req, res) => {
       queueLength: connectionQueue.length,
       maxConnections: MAX_CONCURRENT_CONNECTIONS,
       availableSlots: MAX_CONCURRENT_CONNECTIONS - connections.size,
-      features: ['postgresql', 'csv-upload', 'auto-restore', 'connection-management']
+      features: ['postgresql', 'csv-upload', 'alternative-libraries', 'connection-management']
     });
   } catch (error) {
     res.status(500).json({
@@ -1543,7 +1294,7 @@ app.get('/health', async (req, res) => {
 // 定期的なライブ状態チェック（高精度版、3分ごと）
 setInterval(() => {
   checkLiveStatusAccurate();
-}, 3 * 60 * 1000); // 精度向上のため3分に戻す
+}, 3 * 60 * 1000);
 
 // 定期的な履歴保存（10分ごと）
 setInterval(() => {
@@ -1563,18 +1314,30 @@ async function checkLiveStatusAccurate() {
   for (const [username, userData] of liveData) {
     console.log(`${username}: 段階的チェック開始 (現在: ${userData.isLive ? 'ライブ中' : 'オフライン'})`);
     
-    // 第1段階：簡易チェック
-    let isLive = await checkSingleUserLiveStatus(username);
+    let isLive = null;
     
+    // まず代替ライブラリでチェック
+    try {
+      const alternativeResult = await checkLiveWithAlternatives(username);
+      if (alternativeResult.finalResult) {
+        isLive = alternativeResult.finalResult.isLive;
+        console.log(`${username}: 代替ライブラリ結果 - ${isLive ? 'ライブ中' : 'オフライン'}`);
+      }
+    } catch (alternativeError) {
+      console.log(`${username}: 代替ライブラリエラー、従来方法を試行`);
+    }
+    
+    // 代替ライブラリが失敗した場合は従来の方法
     if (isLive === null) {
-      console.log(`${username}: 第1段階チェック失敗、第2段階へ`);
-      
-      // 第2段階：高精度チェック
-      isLive = await checkSingleUserLiveStatusAccurate(username);
+      isLive = await checkSingleUserLiveStatus(username);
       
       if (isLive === null) {
-        console.log(`${username}: 第2段階チェック失敗、現在の状態を維持`);
-        continue;
+        isLive = await checkSingleUserLiveStatusAccurate(username);
+        
+        if (isLive === null) {
+          console.log(`${username}: 全てのチェック失敗、現在の状態を維持`);
+          continue;
+        }
       }
     }
     
@@ -1593,7 +1356,6 @@ async function checkLiveStatusAccurate() {
       
       // 通知送信
       if (isLive) {
-        // ライブ開始
         io.emit('user-connected', { username, status: 'connected' });
         io.emit('live-status-change', { 
           username, 
@@ -1612,7 +1374,6 @@ async function checkLiveStatusAccurate() {
           }
         }
       } else {
-        // ライブ終了
         const existingConnection = connections.get(username);
         if (existingConnection) {
           existingConnection.disconnect();
@@ -1627,7 +1388,6 @@ async function checkLiveStatusAccurate() {
           message: `${username} がライブを終了しました`
         });
         
-        // 接続枠が空いたのでキューを処理
         setTimeout(() => {
           processConnectionQueue();
         }, 1000);
@@ -1640,125 +1400,6 @@ async function checkLiveStatusAccurate() {
   }
   
   console.log('=== 高精度ライブ状態チェック完了 ===');
-}
-
-// 通知機能付きライブ状態チェック関数（既存を更新）
-async function checkLiveStatus() {
-  console.log('=== ライブ状態チェック開始 ===');
-  console.log(`liveData件数: ${liveData.size}`);
-  console.log(`connections件数: ${connections.size}`);
-  
-  if (liveData.size === 0) {
-    console.log('⚠️ liveDataが空です - ユーザーが存在しません');
-    console.log('=== ライブ状態チェック完了 ===');
-    return;
-  }
-  
-  // デバッグ用: 現在のユーザーを表示
-  console.log('現在のユーザー:', Array.from(liveData.keys()));
-  
-  for (const [username, userData] of liveData) {
-    console.log(`${username}: 状態チェック開始 (現在: ${userData.isLive ? 'ライブ中' : 'オフライン'})`);
-    
-    if (userData.isLive) {
-      try {
-        const testConnection = new WebcastPushConnection(username, {
-          enableExtendedGiftInfo: false,
-        });
-        
-        console.log(`${username}: 接続テスト開始...`);
-        await testConnection.connect();
-        console.log(`${username}: ライブ配信中を確認`);
-        testConnection.disconnect();
-        
-        // まだライブ中の場合、最終更新時間を更新
-        userData.lastUpdate = new Date().toISOString();
-        liveData.set(username, userData);
-        await saveUserToDatabase(username, userData);
-        
-      } catch (error) {
-        console.log(`${username}: 接続テストでエラー - ${error.message}`);
-        
-        if (error.message.includes('LIVE has ended') || error.message.includes('UserOfflineError')) {
-          console.log(`${username}: ライブ終了を検出、オフライン設定`);
-          
-          userData.isLive = false;
-          userData.lastUpdate = new Date().toISOString();
-          liveData.set(username, userData);
-          
-          // データベースに保存
-          await saveUserToDatabase(username, userData);
-          
-          // 既存の接続を切断
-          const existingConnection = connections.get(username);
-          if (existingConnection) {
-            existingConnection.disconnect();
-          }
-          
-          // ライブ終了通知を送信
-          io.emit('user-disconnected', { username });
-          io.emit('live-data-update', { username, data: userData });
-          io.emit('live-status-change', { 
-            username, 
-            status: 'offline',
-            timestamp: userData.lastUpdate,
-            message: `${username} がライブを終了しました`
-          });
-          
-        } else {
-          console.log(`${username}: 予期しないエラー`, error.message);
-        }
-      }
-    } else {
-      console.log(`${username}: オフライン状態なので、ライブ開始チェックを実行`);
-      // オフラインユーザーのライブ開始チェック
-      try {
-        const testConnection = new WebcastPushConnection(username, {
-          enableExtendedGiftInfo: false,
-        });
-        
-        console.log(`${username}: オフライン→オンライン チェック開始...`);
-        await testConnection.connect();
-        console.log(`${username}: ライブ開始を検出！オンライン設定`);
-        testConnection.disconnect();
-        
-        // ライブ開始
-        userData.isLive = true;
-        userData.lastUpdate = new Date().toISOString();
-        liveData.set(username, userData);
-        
-        // データベースに保存
-        await saveUserToDatabase(username, userData);
-        
-        // 本格的なTikTok接続を再開
-        try {
-          await connectToTikTokLive(username);
-          console.log(`${username}: TikTok接続再開成功`);
-        } catch (reconnectError) {
-          console.error(`${username}: TikTok接続再開失敗`, reconnectError);
-        }
-        
-        // ライブ開始通知を送信
-        io.emit('user-connected', { username, status: 'connected' });
-        io.emit('live-data-update', { username, data: userData });
-        io.emit('live-status-change', { 
-          username, 
-          status: 'online',
-          timestamp: userData.lastUpdate,
-          message: `${username} がライブを開始しました`
-        });
-        
-      } catch (error) {
-        console.log(`${username}: オフライン状態確認 - ${error.message}`);
-        // まだオフラインのまま（正常）
-        if (!error.message.includes('LIVE has ended') && !error.message.includes('UserOfflineError')) {
-          console.log(`${username}: オフラインチェック中に予期しないエラー`, error.message);
-        }
-      }
-    }
-  }
-  
-  console.log('=== ライブ状態チェック完了 ===');
 }
 
 // 一括履歴保存
@@ -1776,261 +1417,18 @@ async function saveBulkLiveHistory() {
   console.log('=== 履歴データ保存完了 ===');
 }
 
-
-// =============================================================================
-// 代替ライブラリによるライブ検出システム
-// =============================================================================
-
-const axios = require('axios');
-const cheerio = require('cheerio');
-
-// Toby APIを使用したライブ検出（まずは基本バージョン）
-async function checkLiveWithTobyAPI(username) {
-    console.log(`🔍 [${username}] Toby API でライブ状態チェック開始`);
-    
-    try {
-        // 基本的な実装（Toby APIなしでも動作するように）
-        const result = {
-            isLive: false,
-            userInfo: {},
-            source: 'toby-api'
-        };
-        
-        console.log(`📊 [${username}] Toby API 結果:`, result);
-        return result;
-        
-    } catch (error) {
-        console.log(`❌ [${username}] Toby API エラー:`, error.message);
-        throw error;
-    }
-}
-
-// Web Scrapingによるライブ検出
-async function checkLiveWithScraping(username) {
-    console.log(`🕷️ [${username}] Web Scraping でライブ状態チェック開始`);
-    
-    try {
-        const url = `https://www.tiktok.com/@${username}`;
-        
-        const response = await axios.get(url, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'DNT': '1',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1'
-            },
-            timeout: 15000
-        });
-        
-        const $ = cheerio.load(response.data);
-        
-        // ライブ配信の指標を探す
-        const indicators = {
-            liveText: $('body').text().toLowerCase().includes('live'),
-            liveClass: $('.live').length > 0 || $('[class*="live"]').length > 0,
-            liveData: $('[data-live="true"]').length > 0,
-            roomId: /room_id['"]\s*:\s*['"]\d+['"]/.test(response.data)
-        };
-        
-        const isLive = Object.values(indicators).some(indicator => indicator);
-        
-        const result = {
-            isLive: isLive,
-            indicators: indicators,
-            source: 'web-scraping'
-        };
-        
-        console.log(`📊 [${username}] Web Scraping 結果:`, result);
-        return result;
-        
-    } catch (error) {
-        console.log(`❌ [${username}] Web Scraping エラー:`, error.message);
-        throw error;
-    }
-}
-
-// 直接APIによるライブ検出
-async function checkLiveWithDirectAPI(username) {
-    console.log(`🎯 [${username}] 直接API でライブ状態チェック開始`);
-    
-    try {
-        const apiUrl = `https://www.tiktok.com/api/user/detail/?uniqueId=${username}`;
-        
-        const response = await axios.get(apiUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Referer': `https://www.tiktok.com/@${username}`,
-                'Accept': 'application/json',
-                'Accept-Language': 'en-US,en;q=0.9'
-            },
-            timeout: 10000
-        });
-        
-        if (response.data && response.data.userInfo) {
-            const userInfo = response.data.userInfo;
-            const user = userInfo.user;
-            
-            const isLive = userInfo.stats?.roomId || user.roomId || false;
-            
-            const result = {
-                isLive: !!isLive,
-                userInfo: {
-                    followerCount: userInfo.stats?.followerCount || 0,
-                    followingCount: userInfo.stats?.followingCount || 0,
-                    heartCount: userInfo.stats?.heartCount || 0,
-                    videoCount: userInfo.stats?.videoCount || 0,
-                    verified: user.verified || false,
-                    roomId: userInfo.stats?.roomId || user.roomId || null
-                },
-                source: 'direct-api'
-            };
-            
-            console.log(`📊 [${username}] 直接API 結果:`, result);
-            return result;
-        }
-        
-        throw new Error('APIレスポンスの形式が異常');
-        
-    } catch (error) {
-        console.log(`❌ [${username}] 直接API エラー:`, error.message);
-        throw error;
-    }
-}
-
-// 統合ライブ検出関数
-async function checkLiveWithAlternatives(username) {
-    console.log(`🔄 [${username}] 代替ライブラリによる統合チェック開始`);
-    
-    const results = {
-        username: username,
-        timestamp: new Date().toISOString(),
-        attempts: [],
-        finalResult: null
-    };
-    
-    // 方法1: 直接API（最も成功しやすい）
-    try {
-        const directResult = await checkLiveWithDirectAPI(username);
-        results.attempts.push({
-            method: 'direct-api',
-            result: 'success',
-            data: directResult
-        });
-        
-        if (directResult.isLive) {
-            results.finalResult = { isLive: true, source: 'direct-api', confidence: 'high' };
-            return results;
-        }
-    } catch (directError) {
-        results.attempts.push({
-            method: 'direct-api',
-            result: 'error',
-            error: { message: directError.message }
-        });
-    }
-    
-    // 方法2: Web Scraping
-    try {
-        await new Promise(resolve => setTimeout(resolve, 3000)); // 3秒待機
-        
-        const scrapingResult = await checkLiveWithScraping(username);
-        results.attempts.push({
-            method: 'web-scraping',
-            result: 'success',
-            data: scrapingResult
-        });
-        
-        if (scrapingResult.isLive) {
-            results.finalResult = { isLive: true, source: 'web-scraping', confidence: 'medium' };
-            return results;
-        }
-    } catch (scrapingError) {
-        results.attempts.push({
-            method: 'web-scraping',
-            result: 'error',
-            error: { message: scrapingError.message }
-        });
-    }
-    
-    // 全て失敗またはオフライン
-    results.finalResult = { isLive: false, source: 'all-methods', confidence: 'high' };
-    return results;
-}
-
-// 代替ライブラリテストAPI
-app.post('/api/test-alternative-libs', async (req, res) => {
-    const { username } = req.body;
-    
-    if (!username) {
-        return res.status(400).json({ error: 'ユーザー名が必要です' });
-    }
-    
-    const cleanUsername = username.replace('@', '').trim();
-    console.log(`🔄 代替ライブラリテスト開始: ${cleanUsername}`);
-    
-    try {
-        const results = await checkLiveWithAlternatives(cleanUsername);
-        
-        console.log(`📊 代替ライブラリテスト結果 [${cleanUsername}]:`, JSON.stringify(results, null, 2));
-        
-        res.json({
-            success: true,
-            username: cleanUsername,
-            results: results,
-            timestamp: new Date().toISOString()
-        });
-        
-    } catch (error) {
-        console.error(`❌ 代替ライブラリテストエラー [${cleanUsername}]:`, error);
-        res.status(500).json({ 
-            error: `代替ライブラリテストエラー: ${error.message}`,
-            username: cleanUsername
-        });
-    }
-});
-
-// 代替ライブラリ情報API
-app.get('/api/alternative-lib-info', (req, res) => {
-    res.json({
-        success: true,
-        libraries: [
-            {
-                name: 'axios',
-                version: 'latest',
-                status: 'available'
-            },
-            {
-                name: 'cheerio',
-                version: 'latest',
-                status: 'available'
-            }
-        ],
-        methods: [
-            'direct-api',
-            'web-scraping'
-        ],
-        timestamp: new Date().toISOString()
-    });
-});
-
-// =============================================================================
-// 代替ライブラリコード終了
-// =============================================================================
-
 // サーバー起動
 const PORT = process.env.PORT || 10000;
 
 // データベース初期化後にサーバー起動
 initializeDatabase().then(() => {
   server.listen(PORT, '0.0.0.0', () => {
-    console.log(`=== TikTok Live Monitor Server (Connection Management) ===`);
+    console.log(`=== TikTok Live Monitor Server (Alternative Libraries) ===`);
     console.log(`Server running on port ${PORT}`);
     console.log(`Max connections: ${MAX_CONCURRENT_CONNECTIONS}`);
     console.log(`Timestamp: ${new Date().toISOString()}`);
-    console.log(`Features: PostgreSQL, CSV Upload, Auto Restore, Connection Management`);
+    console.log(`Features: PostgreSQL, CSV Upload, Alternative Libraries, Connection Management`);
+    console.log(`Libraries: axios, cheerio, tiktok-live-connector`);
     console.log(`Health check: /health`);
     console.log(`API Base: /api`);
   });
@@ -2056,13 +1454,11 @@ process.on('unhandledRejection', (err) => {
 process.on('SIGTERM', async () => {
   console.log('サーバーを停止しています...');
   
-  // 全ての接続を切断
   connections.forEach((connection, username) => {
     console.log(`${username} の接続を切断中...`);
     connection.disconnect();
   });
   
-  // データベース接続を閉じる
   await pool.end();
   
   server.close(() => {
