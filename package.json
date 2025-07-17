@@ -1,7 +1,7 @@
 {
   "name": "tiktok-live-monitor",
-  "version": "2.0.0",
-  "description": "TikTok Live監視システム",
+  "version": "3.0.0",
+  "description": "TikTok Live監視システム（代替ライブラリ統合版）",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -14,7 +14,8 @@
     "csv-parser": "^3.0.0",
     "pg": "^8.12.0",
     "axios": "^1.6.7",
-    "cheerio": "^1.0.0-rc.12"
+    "cheerio": "^1.0.0-rc.12",
+    "tiktok-live-connector": "^1.2.3"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -23,7 +24,8 @@
     "tiktok",
     "live",
     "monitor",
-    "realtime"
+    "realtime",
+    "alternative"
   ],
   "author": "Your Name",
   "license": "MIT"
