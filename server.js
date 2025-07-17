@@ -1776,6 +1776,250 @@ async function saveBulkLiveHistory() {
   console.log('=== 履歴データ保存完了 ===');
 }
 
+
+// =============================================================================
+// 代替ライブラリによるライブ検出システム
+// =============================================================================
+
+const axios = require('axios');
+const cheerio = require('cheerio');
+
+// Toby APIを使用したライブ検出（まずは基本バージョン）
+async function checkLiveWithTobyAPI(username) {
+    console.log(`🔍 [${username}] Toby API でライブ状態チェック開始`);
+    
+    try {
+        // 基本的な実装（Toby APIなしでも動作するように）
+        const result = {
+            isLive: false,
+            userInfo: {},
+            source: 'toby-api'
+        };
+        
+        console.log(`📊 [${username}] Toby API 結果:`, result);
+        return result;
+        
+    } catch (error) {
+        console.log(`❌ [${username}] Toby API エラー:`, error.message);
+        throw error;
+    }
+}
+
+// Web Scrapingによるライブ検出
+async function checkLiveWithScraping(username) {
+    console.log(`🕷️ [${username}] Web Scraping でライブ状態チェック開始`);
+    
+    try {
+        const url = `https://www.tiktok.com/@${username}`;
+        
+        const response = await axios.get(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1'
+            },
+            timeout: 15000
+        });
+        
+        const $ = cheerio.load(response.data);
+        
+        // ライブ配信の指標を探す
+        const indicators = {
+            liveText: $('body').text().toLowerCase().includes('live'),
+            liveClass: $('.live').length > 0 || $('[class*="live"]').length > 0,
+            liveData: $('[data-live="true"]').length > 0,
+            roomId: /room_id['"]\s*:\s*['"]\d+['"]/.test(response.data)
+        };
+        
+        const isLive = Object.values(indicators).some(indicator => indicator);
+        
+        const result = {
+            isLive: isLive,
+            indicators: indicators,
+            source: 'web-scraping'
+        };
+        
+        console.log(`📊 [${username}] Web Scraping 結果:`, result);
+        return result;
+        
+    } catch (error) {
+        console.log(`❌ [${username}] Web Scraping エラー:`, error.message);
+        throw error;
+    }
+}
+
+// 直接APIによるライブ検出
+async function checkLiveWithDirectAPI(username) {
+    console.log(`🎯 [${username}] 直接API でライブ状態チェック開始`);
+    
+    try {
+        const apiUrl = `https://www.tiktok.com/api/user/detail/?uniqueId=${username}`;
+        
+        const response = await axios.get(apiUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': `https://www.tiktok.com/@${username}`,
+                'Accept': 'application/json',
+                'Accept-Language': 'en-US,en;q=0.9'
+            },
+            timeout: 10000
+        });
+        
+        if (response.data && response.data.userInfo) {
+            const userInfo = response.data.userInfo;
+            const user = userInfo.user;
+            
+            const isLive = userInfo.stats?.roomId || user.roomId || false;
+            
+            const result = {
+                isLive: !!isLive,
+                userInfo: {
+                    followerCount: userInfo.stats?.followerCount || 0,
+                    followingCount: userInfo.stats?.followingCount || 0,
+                    heartCount: userInfo.stats?.heartCount || 0,
+                    videoCount: userInfo.stats?.videoCount || 0,
+                    verified: user.verified || false,
+                    roomId: userInfo.stats?.roomId || user.roomId || null
+                },
+                source: 'direct-api'
+            };
+            
+            console.log(`📊 [${username}] 直接API 結果:`, result);
+            return result;
+        }
+        
+        throw new Error('APIレスポンスの形式が異常');
+        
+    } catch (error) {
+        console.log(`❌ [${username}] 直接API エラー:`, error.message);
+        throw error;
+    }
+}
+
+// 統合ライブ検出関数
+async function checkLiveWithAlternatives(username) {
+    console.log(`🔄 [${username}] 代替ライブラリによる統合チェック開始`);
+    
+    const results = {
+        username: username,
+        timestamp: new Date().toISOString(),
+        attempts: [],
+        finalResult: null
+    };
+    
+    // 方法1: 直接API（最も成功しやすい）
+    try {
+        const directResult = await checkLiveWithDirectAPI(username);
+        results.attempts.push({
+            method: 'direct-api',
+            result: 'success',
+            data: directResult
+        });
+        
+        if (directResult.isLive) {
+            results.finalResult = { isLive: true, source: 'direct-api', confidence: 'high' };
+            return results;
+        }
+    } catch (directError) {
+        results.attempts.push({
+            method: 'direct-api',
+            result: 'error',
+            error: { message: directError.message }
+        });
+    }
+    
+    // 方法2: Web Scraping
+    try {
+        await new Promise(resolve => setTimeout(resolve, 3000)); // 3秒待機
+        
+        const scrapingResult = await checkLiveWithScraping(username);
+        results.attempts.push({
+            method: 'web-scraping',
+            result: 'success',
+            data: scrapingResult
+        });
+        
+        if (scrapingResult.isLive) {
+            results.finalResult = { isLive: true, source: 'web-scraping', confidence: 'medium' };
+            return results;
+        }
+    } catch (scrapingError) {
+        results.attempts.push({
+            method: 'web-scraping',
+            result: 'error',
+            error: { message: scrapingError.message }
+        });
+    }
+    
+    // 全て失敗またはオフライン
+    results.finalResult = { isLive: false, source: 'all-methods', confidence: 'high' };
+    return results;
+}
+
+// 代替ライブラリテストAPI
+app.post('/api/test-alternative-libs', async (req, res) => {
+    const { username } = req.body;
+    
+    if (!username) {
+        return res.status(400).json({ error: 'ユーザー名が必要です' });
+    }
+    
+    const cleanUsername = username.replace('@', '').trim();
+    console.log(`🔄 代替ライブラリテスト開始: ${cleanUsername}`);
+    
+    try {
+        const results = await checkLiveWithAlternatives(cleanUsername);
+        
+        console.log(`📊 代替ライブラリテスト結果 [${cleanUsername}]:`, JSON.stringify(results, null, 2));
+        
+        res.json({
+            success: true,
+            username: cleanUsername,
+            results: results,
+            timestamp: new Date().toISOString()
+        });
+        
+    } catch (error) {
+        console.error(`❌ 代替ライブラリテストエラー [${cleanUsername}]:`, error);
+        res.status(500).json({ 
+            error: `代替ライブラリテストエラー: ${error.message}`,
+            username: cleanUsername
+        });
+    }
+});
+
+// 代替ライブラリ情報API
+app.get('/api/alternative-lib-info', (req, res) => {
+    res.json({
+        success: true,
+        libraries: [
+            {
+                name: 'axios',
+                version: 'latest',
+                status: 'available'
+            },
+            {
+                name: 'cheerio',
+                version: 'latest',
+                status: 'available'
+            }
+        ],
+        methods: [
+            'direct-api',
+            'web-scraping'
+        ],
+        timestamp: new Date().toISOString()
+    });
+});
+
+// =============================================================================
+// 代替ライブラリコード終了
+// =============================================================================
+
 // サーバー起動
 const PORT = process.env.PORT || 10000;
 
