@@ -313,13 +313,28 @@ async function checkSingleUserLiveStatusAccurate(username) {
   } catch (error) {
     console.log(`${username}: ライブ状態チェックエラー - ${error.message}`);
     
-    if (error.message.includes('LIVE has ended') || 
-        error.message.includes('UserOfflineError') ||
-        error.message.includes('User is not live') ||
-        error.message.includes('Room not found') ||
-        error.message.includes('Connection timeout')) {
-      
-      console.log(`${username}: オフライン状態を確認`);
+    // オフライン判定に該当するエラーパターンを追加
+    const offlineErrors = [
+      'LIVE has ended',
+      'UserOfflineError',
+      'User is not live',
+      'Room not found',
+      'Connection timeout',
+      'Failed to retrieve the initial room data',  // 新しく追加
+      'Failed to connect to websocket',
+      'Unable to retrieve room data',
+      'Room is not available',
+      'Stream is not available',
+      'User does not exist',
+      'Private account or user not found'
+    ];
+    
+    const isOffline = offlineErrors.some(pattern => 
+      error.message.includes(pattern)
+    );
+    
+    if (isOffline) {
+      console.log(`${username}: オフライン状態を確認 (エラー: ${error.message})`);
       return false;
     }
     
@@ -536,54 +551,86 @@ async function connectToTikTokLive(username) {
 
 // API エンドポイント
 
-// ユーザー追加（修正版）
+// ユーザー追加（完全修正版）
 app.post('/api/add-user', async (req, res) => {
   const { username } = req.body;
   
+  console.log('ユーザー追加リクエスト受信:', req.body);
+  
   if (!username) {
+    console.log('エラー: ユーザー名が空');
     return res.status(400).json({ error: 'ユーザー名が必要です' });
   }
   
   const cleanUsername = username.replace('@', '').trim();
   
   if (!cleanUsername) {
+    console.log('エラー: 有効なユーザー名なし');
     return res.status(400).json({ error: '有効なユーザー名を入力してください' });
   }
   
+  console.log(`${cleanUsername}: ユーザー追加処理開始`);
+  
   try {
-    console.log(`${cleanUsername}: ユーザー追加開始`);
-    
     // データベースで重複チェック
+    console.log(`${cleanUsername}: 重複チェック開始`);
     const existingUser = await pool.query('SELECT username FROM users WHERE username = $1', [cleanUsername]);
+    
     if (existingUser.rows.length > 0) {
+      console.log(`${cleanUsername}: 既に存在`);
       return res.status(400).json({ error: 'このユーザーは既に監視中です' });
     }
+    
+    console.log(`${cleanUsername}: 重複なし、追加処理継続`);
+    
+    // まずliveDataに基本データを作成
+    const userData = {
+      username: cleanUsername,
+      isLive: false,  // 初期状態はオフライン
+      viewerCount: 0,
+      totalComments: 0,
+      totalGifts: 0,
+      totalDiamonds: 0,
+      lastUpdate: new Date().toISOString(),
+      recentComments: [],
+      recentGifts: []
+    };
+    
+    liveData.set(cleanUsername, userData);
+    console.log(`${cleanUsername}: liveDataに追加完了`);
+    
+    // データベースに追加
+    const insertQuery = `
+      INSERT INTO users (username, status, is_live, total_diamonds, total_gifts, total_comments, viewer_count, last_live_check)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    `;
+    
+    const currentTime = new Date();
+    
+    await pool.query(insertQuery, [
+      cleanUsername,
+      'monitoring',  // 初期状態は monitoring
+      false,         // 初期状態はオフライン
+      0,            // total_diamonds
+      0,            // total_gifts
+      0,            // total_comments
+      0,            // viewer_count
+      currentTime   // last_live_check
+    ]);
+    
+    console.log(`${cleanUsername}: データベースに追加完了`);
     
     // 接続数制限チェック
     if (connections.size >= MAX_CONCURRENT_CONNECTIONS) {
       console.log(`${cleanUsername}: 接続制限により待機キューに追加`);
       
-      // データベースに待機状態で追加
-      await pool.query(`
-        INSERT INTO users (username, status, is_live, total_diamonds, total_gifts, total_comments, viewer_count)
-        VALUES ($1, 'waiting', false, 0, 0, 0, 0)
-      `, [cleanUsername]);
-      
-      // liveDataに追加
-      const userData = {
-        username: cleanUsername,
-        isLive: false,
-        viewerCount: 0,
-        totalComments: 0,
-        totalGifts: 0,
-        totalDiamonds: 0,
-        lastUpdate: new Date().toISOString(),
-        recentComments: [],
-        recentGifts: []
-      };
-      liveData.set(cleanUsername, userData);
+      // ステータスを待機中に変更
+      await pool.query('UPDATE users SET status = $1 WHERE username = $2', ['waiting', cleanUsername]);
       
       connectionQueue.push(cleanUsername);
+      
+      // クライアントに通知
+      io.emit('live-data-update', { username: cleanUsername, data: userData });
       
       return res.json({ 
         message: `${cleanUsername} を追加しました（接続待機中: ${connectionQueue.length}番目）`,
@@ -593,28 +640,37 @@ app.post('/api/add-user', async (req, res) => {
     }
     
     // TikTok接続を試行
-    console.log(`${cleanUsername}: TikTok接続試行中...`);
+    console.log(`${cleanUsername}: TikTok接続試行開始`);
     
     try {
       await connectToTikTokLive(cleanUsername);
       console.log(`${cleanUsername}: TikTok接続成功`);
       
-      // 接続成功後、即座にライブ状態をチェック
+      // 接続成功の通知
+      io.emit('user-connected', { username: cleanUsername, status: 'connected' });
+      io.emit('live-data-update', { username: cleanUsername, data: userData });
+      
+      // 5秒後にライブ状態をチェック
       setTimeout(async () => {
-        console.log(`${cleanUsername}: 追加後のライブ状態チェック`);
-        const isLive = await checkSingleUserLiveStatusAccurate(cleanUsername);
-        
-        if (isLive !== null) {
-          const userData = liveData.get(cleanUsername);
-          if (userData) {
-            userData.isLive = isLive;
-            userData.lastUpdate = new Date().toISOString();
-            liveData.set(cleanUsername, userData);
-            await saveUserToDatabase(cleanUsername, userData);
-            
-            io.emit('live-data-update', { username: cleanUsername, data: userData });
-            console.log(`${cleanUsername}: 初期ライブ状態設定完了 (${isLive ? 'ライブ中' : 'オフライン'})`);
+        console.log(`${cleanUsername}: 追加後ライブ状態チェック開始`);
+        try {
+          const isLive = await checkSingleUserLiveStatusAccurate(cleanUsername);
+          
+          if (isLive !== null) {
+            const currentUserData = liveData.get(cleanUsername);
+            if (currentUserData) {
+              currentUserData.isLive = isLive;
+              currentUserData.lastUpdate = new Date().toISOString();
+              liveData.set(cleanUsername, currentUserData);
+              await saveUserToDatabase(cleanUsername, currentUserData);
+              
+              // 状態変更を通知
+              io.emit('live-data-update', { username: cleanUsername, data: currentUserData });
+              console.log(`${cleanUsername}: 初期ライブ状態設定完了 (${isLive ? 'ライブ中' : 'オフライン'})`);
+            }
           }
+        } catch (statusError) {
+          console.error(`${cleanUsername}: 状態チェックエラー`, statusError);
         }
       }, 5000);
       
@@ -624,47 +680,34 @@ app.post('/api/add-user', async (req, res) => {
       });
       
     } catch (connectError) {
-      console.error(`${cleanUsername}: TikTok接続失敗`, connectError);
+      console.log(`${cleanUsername}: TikTok接続失敗 - ${connectError.message}`);
       
-      // 接続失敗でもデータベースには追加（待機状態）
-      await pool.query(`
-        INSERT INTO users (username, status, is_live, total_diamonds, total_gifts, total_comments, viewer_count)
-        VALUES ($1, 'waiting', false, 0, 0, 0, 0)
-      `, [cleanUsername]);
-      
-      // liveDataに追加
-      const userData = {
-        username: cleanUsername,
-        isLive: false,
-        viewerCount: 0,
-        totalComments: 0,
-        totalGifts: 0,
-        totalDiamonds: 0,
-        lastUpdate: new Date().toISOString(),
-        recentComments: [],
-        recentGifts: []
-      };
-      liveData.set(cleanUsername, userData);
-      
-      connectionQueue.push(cleanUsername);
-      
+      // 接続失敗でもユーザーは追加済み（監視状態のまま）
       // エラーメッセージを分かりやすく
       let errorMessage = connectError.message;
-      if (connectError.message.includes('LIVE has ended')) {
-        errorMessage = '現在ライブ配信をしていません（監視は開始されました）';
+      if (connectError.message.includes('LIVE has ended') || 
+          connectError.message.includes('Failed to retrieve the initial room data')) {
+        errorMessage = '現在ライブ配信をしていません';
       } else if (connectError.message.includes('UserOfflineError')) {
-        errorMessage = 'オフラインです（監視は開始されました）';
+        errorMessage = 'オフラインです';
       }
       
+      // クライアントに通知
+      io.emit('live-data-update', { username: cleanUsername, data: userData });
+      
       res.json({
-        message: `${cleanUsername} を追加しました（接続エラー: ${errorMessage}）`,
-        status: 'waiting',
+        message: `${cleanUsername} を追加しました（${errorMessage}）`,
+        status: 'monitoring',
         warning: errorMessage
       });
     }
     
   } catch (error) {
     console.error(`${cleanUsername}: ユーザー追加エラー`, error);
+    
+    // エラー時はliveDataからも削除
+    liveData.delete(cleanUsername);
+    
     res.status(500).json({ error: `追加エラー: ${error.message}` });
   }
 });
@@ -833,6 +876,43 @@ app.post('/api/upload-csv', upload.single('csvfile'), async (req, res) => {
   }
 });
 
+// 特定ユーザーの詳細チェック（テスト用）
+app.post('/api/check-user-detailed', async (req, res) => {
+  const { username } = req.body;
+  
+  if (!username) {
+    return res.status(400).json({ error: 'ユーザー名が必要です' });
+  }
+  
+  const cleanUsername = username.replace('@', '').trim();
+  
+  try {
+    console.log(`${cleanUsername}: 詳細チェック開始`);
+    
+    // 第1段階：基本チェック
+    const basicResult = await checkSingleUserLiveStatus(cleanUsername);
+    
+    // 第2段階：高精度チェック
+    const accurateResult = await checkSingleUserLiveStatusAccurate(cleanUsername);
+    
+    // 現在のliveDataの状態
+    const currentData = liveData.get(cleanUsername);
+    
+    res.json({
+      username: cleanUsername,
+      basicCheck: basicResult,
+      accurateCheck: accurateResult,
+      currentLiveData: currentData || null,
+      finalStatus: accurateResult !== null ? accurateResult : basicResult,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error(`${cleanUsername}: 詳細チェックエラー`, error);
+    res.status(500).json({ error: `チェックエラー: ${error.message}` });
+  }
+});
+
 // 緊急対応：liveData手動復元API
 app.post('/api/restore-live-data', async (req, res) => {
   try {
@@ -881,6 +961,97 @@ app.post('/api/restore-live-data', async (req, res) => {
   } catch (error) {
     console.error('手動liveData復元エラー:', error);
     res.status(500).json({ error: '復元に失敗しました' });
+  }
+});
+
+// デバッグ用：ユーザー追加ログAPI
+app.post('/api/debug-add-user', async (req, res) => {
+  const { username } = req.body;
+  
+  console.log('=== デバッグ：ユーザー追加開始 ===');
+  console.log('リクエストボディ:', req.body);
+  console.log('受信ユーザー名:', username);
+  
+  if (!username) {
+    console.log('エラー: ユーザー名が空');
+    return res.status(400).json({ 
+      error: 'ユーザー名が必要です',
+      debug: { receivedBody: req.body }
+    });
+  }
+  
+  const cleanUsername = username.replace('@', '').trim();
+  console.log('クリーンアップ後:', cleanUsername);
+  
+  try {
+    // 現在の状態確認
+    const currentState = {
+      liveDataSize: liveData.size,
+      connectionsSize: connections.size,
+      queueLength: connectionQueue.length,
+      maxConnections: MAX_CONCURRENT_CONNECTIONS
+    };
+    
+    console.log('現在の状態:', currentState);
+    
+    // データベース状態確認
+    const existingUser = await pool.query('SELECT username, status FROM users WHERE username = $1', [cleanUsername]);
+    console.log('データベース確認結果:', existingUser.rows);
+    
+    // liveData確認
+    const existingLiveData = liveData.get(cleanUsername);
+    console.log('既存liveData:', existingLiveData);
+    
+    if (existingUser.rows.length > 0) {
+      return res.status(400).json({ 
+        error: 'このユーザーは既に監視中です',
+        debug: {
+          existingUser: existingUser.rows[0],
+          existingLiveData: existingLiveData,
+          currentState: currentState
+        }
+      });
+    }
+    
+    // 実際の追加テスト（データベースのみ）
+    const insertQuery = `
+      INSERT INTO users (username, status, is_live, total_diamonds, total_gifts, total_comments, viewer_count, last_live_check)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING *
+    `;
+    
+    const insertResult = await pool.query(insertQuery, [
+      cleanUsername,
+      'monitoring',
+      false,
+      0,
+      0,
+      0,
+      0,
+      new Date()
+    ]);
+    
+    console.log('データベース挿入結果:', insertResult.rows[0]);
+    
+    res.json({
+      success: true,
+      message: 'デバッグ追加テスト成功',
+      debug: {
+        cleanUsername: cleanUsername,
+        insertedUser: insertResult.rows[0],
+        currentState: currentState
+      }
+    });
+    
+  } catch (error) {
+    console.error('デバッグ追加エラー:', error);
+    res.status(500).json({ 
+      error: error.message,
+      debug: {
+        cleanUsername: cleanUsername,
+        errorStack: error.stack
+      }
+    });
   }
 });
 
