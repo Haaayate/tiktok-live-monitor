@@ -551,6 +551,248 @@ async function connectToTikTokLive(username) {
 
 // API エンドポイント
 
+// =============================================================================
+// TikTok接続デバッグ機能 - 追加開始
+// =============================================================================
+
+// より詳細なデバッグ付きTikTok接続テスト
+async function debugTikTokConnection(username) {
+    console.log(`🐛 [${username}] TikTok接続デバッグ開始`);
+    console.log(`📦 tiktok-live-connector バージョン: ${require('tiktok-live-connector/package.json').version}`);
+    
+    const results = {
+        username,
+        timestamp: new Date().toISOString(),
+        libraryVersion: require('tiktok-live-connector/package.json').version,
+        attempts: [],
+        systemInfo: {
+            nodeVersion: process.version,
+            platform: process.platform,
+            env: process.env.NODE_ENV
+        }
+    };
+    
+    // 試行1: 最小設定での接続
+    try {
+        console.log(`🔍 [${username}] 最小設定テスト...`);
+        
+        const connection = new WebcastPushConnection(username, {
+            enableExtendedGiftInfo: false,
+            processInitialData: false,
+            enableWebsocketUpgrade: false,
+            requestPollingIntervalMs: 2000,
+            requestOptions: {
+                timeout: 10000
+            }
+        });
+        
+        // 詳細なイベントリスナーを追加
+        connection.on('connect', (state) => {
+            console.log(`✅ [${username}] 接続イベント発生:`, state);
+        });
+        
+        connection.on('error', (error) => {
+            console.log(`❌ [${username}] エラーイベント:`, error);
+        });
+        
+        connection.on('disconnect', () => {
+            console.log(`🔌 [${username}] 切断イベント`);
+        });
+        
+        // タイムアウト付きで接続
+        const connectPromise = connection.connect();
+        const timeoutPromise = new Promise((_, reject) => {
+            setTimeout(() => reject(new Error('接続タイムアウト (10秒)')), 10000);
+        });
+        
+        const connectResult = await Promise.race([connectPromise, timeoutPromise]);
+        
+        console.log(`✅ [${username}] 最小設定接続成功:`, connectResult);
+        
+        results.attempts.push({
+            method: 'minimal_config',
+            result: 'success',
+            connectResult: connectResult,
+            message: 'ライブ配信中（最小設定）'
+        });
+        
+        // 少し待ってから切断
+        setTimeout(() => {
+            connection.disconnect();
+        }, 2000);
+        
+        return { isLive: true, details: results };
+        
+    } catch (error) {
+        console.log(`❌ [${username}] 最小設定エラー:`, error);
+        console.log(`📊 [${username}] エラー詳細:`, {
+            name: error.name,
+            message: error.message,
+            stack: error.stack,
+            code: error.code
+        });
+        
+        results.attempts.push({
+            method: 'minimal_config',
+            result: 'error',
+            error: {
+                name: error.name,
+                message: error.message,
+                code: error.code
+            }
+        });
+    }
+    
+    // 試行2: 異なるユーザーエージェント設定
+    try {
+        console.log(`🔍 [${username}] カスタムヘッダーテスト...`);
+        
+        const connection = new WebcastPushConnection(username, {
+            enableExtendedGiftInfo: false,
+            requestHeaders: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            },
+            requestOptions: {
+                timeout: 15000
+            }
+        });
+        
+        await connection.connect();
+        console.log(`✅ [${username}] カスタムヘッダー接続成功`);
+        
+        results.attempts.push({
+            method: 'custom_headers',
+            result: 'success',
+            message: 'ライブ配信中（カスタムヘッダー）'
+        });
+        
+        setTimeout(() => {
+            connection.disconnect();
+        }, 2000);
+        
+        return { isLive: true, details: results };
+        
+    } catch (error) {
+        console.log(`❌ [${username}] カスタムヘッダーエラー:`, error.message);
+        
+        results.attempts.push({
+            method: 'custom_headers',
+            result: 'error',
+            error: {
+                message: error.message,
+                code: error.code
+            }
+        });
+    }
+    
+    // 試行3: WebSocket無効化テスト
+    try {
+        console.log(`🔍 [${username}] WebSocket無効化テスト...`);
+        
+        const connection = new WebcastPushConnection(username, {
+            enableExtendedGiftInfo: false,
+            enableWebsocketUpgrade: false,
+            processInitialData: true,
+            requestPollingIntervalMs: 1000
+        });
+        
+        await connection.connect();
+        console.log(`✅ [${username}] WebSocket無効化接続成功`);
+        
+        results.attempts.push({
+            method: 'no_websocket',
+            result: 'success',
+            message: 'ライブ配信中（WebSocket無効）'
+        });
+        
+        setTimeout(() => {
+            connection.disconnect();
+        }, 2000);
+        
+        return { isLive: true, details: results };
+        
+    } catch (error) {
+        console.log(`❌ [${username}] WebSocket無効化エラー:`, error.message);
+        
+        results.attempts.push({
+            method: 'no_websocket',
+            result: 'error',
+            error: {
+                message: error.message
+            }
+        });
+    }
+    
+    console.log(`⚫ [${username}] 全ての接続方法が失敗`);
+    return { isLive: false, details: results };
+}
+
+// デバッグテスト用APIエンドポイント
+app.post('/api/debug-tiktok-connection', async (req, res) => {
+    const { username } = req.body;
+    
+    if (!username) {
+        return res.status(400).json({ error: 'ユーザー名が必要です' });
+    }
+    
+    const cleanUsername = username.replace('@', '').trim();
+    console.log(`🐛 TikTok接続デバッグ開始: ${cleanUsername}`);
+    
+    try {
+        const result = await debugTikTokConnection(cleanUsername);
+        
+        console.log(`📊 デバッグ結果 [${cleanUsername}]:`, JSON.stringify(result, null, 2));
+        
+        res.json({
+            success: true,
+            username: cleanUsername,
+            result: result,
+            timestamp: new Date().toISOString()
+        });
+        
+    } catch (error) {
+        console.error(`❌ デバッグエラー [${cleanUsername}]:`, error);
+        res.status(500).json({ 
+            error: `デバッグエラー: ${error.message}`,
+            username: cleanUsername
+        });
+    }
+});
+
+// ライブラリ情報確認用エンドポイント
+app.get('/api/library-info', (req, res) => {
+    try {
+        const packageInfo = require('tiktok-live-connector/package.json');
+        
+        res.json({
+            success: true,
+            library: {
+                name: packageInfo.name,
+                version: packageInfo.version,
+                description: packageInfo.description,
+                lastModified: packageInfo._time || 'unknown'
+            },
+            system: {
+                nodeVersion: process.version,
+                platform: process.platform,
+                architecture: process.arch,
+                environment: process.env.NODE_ENV || 'development'
+            },
+            timestamp: new Date().toISOString()
+        });
+        
+    } catch (error) {
+        res.status(500).json({
+            error: 'ライブラリ情報の取得に失敗しました',
+            details: error.message
+        });
+    }
+});
+
+// =============================================================================
+// TikTok接続デバッグ機能 - 追加終了
+// =============================================================================
+
 // ユーザー追加（完全修正版）
 app.post('/api/add-user', async (req, res) => {
   const { username } = req.body;
