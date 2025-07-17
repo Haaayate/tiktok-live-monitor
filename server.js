@@ -551,6 +551,7 @@ async function connectToTikTokLive(username) {
 
 // API エンドポイント
 
+
 // =============================================================================
 // TikTok接続デバッグ機能 - 追加開始
 // =============================================================================
@@ -726,6 +727,73 @@ async function debugTikTokConnection(username) {
     console.log(`⚫ [${username}] 全ての接続方法が失敗`);
     return { isLive: false, details: results };
 }
+
+// デバッグテスト用APIエンドポイント
+app.post('/api/debug-tiktok-connection', async (req, res) => {
+    const { username } = req.body;
+    
+    if (!username) {
+        return res.status(400).json({ error: 'ユーザー名が必要です' });
+    }
+    
+    const cleanUsername = username.replace('@', '').trim();
+    console.log(`🐛 TikTok接続デバッグ開始: ${cleanUsername}`);
+    
+    try {
+        const result = await debugTikTokConnection(cleanUsername);
+        
+        console.log(`📊 デバッグ結果 [${cleanUsername}]:`, JSON.stringify(result, null, 2));
+        
+        res.json({
+            success: true,
+            username: cleanUsername,
+            result: result,
+            timestamp: new Date().toISOString()
+        });
+        
+    } catch (error) {
+        console.error(`❌ デバッグエラー [${cleanUsername}]:`, error);
+        res.status(500).json({ 
+            error: `デバッグエラー: ${error.message}`,
+            username: cleanUsername
+        });
+    }
+});
+
+// ライブラリ情報確認用エンドポイント
+app.get('/api/library-info', (req, res) => {
+    try {
+        const packageInfo = require('tiktok-live-connector/package.json');
+        
+        res.json({
+            success: true,
+            library: {
+                name: packageInfo.name,
+                version: packageInfo.version,
+                description: packageInfo.description,
+                lastModified: packageInfo._time || 'unknown'
+            },
+            system: {
+                nodeVersion: process.version,
+                platform: process.platform,
+                architecture: process.arch,
+                environment: process.env.NODE_ENV || 'development'
+            },
+            timestamp: new Date().toISOString()
+        });
+        
+    } catch (error) {
+        res.status(500).json({
+            error: 'ライブラリ情報の取得に失敗しました',
+            details: error.message
+        });
+    }
+});
+
+// =============================================================================
+// TikTok接続デバッグ機能 - 追加終了
+// =============================================================================
+
 
 // デバッグテスト用APIエンドポイント
 app.post('/api/debug-tiktok-connection', async (req, res) => {
